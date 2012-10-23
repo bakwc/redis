@@ -233,6 +233,24 @@ void loadServerConfigFromString(char *config) {
             server.masterhost = sdsnew(argv[1]);
             server.masterport = atoi(argv[2]);
             server.repl_state = REDIS_REPL_CONNECT;
+        } else if (!strcasecmp(argv[0],"sentinels") && argc >= 4) {
+            int j = 0;
+            server.sentinels = listCreate();
+            server.sentinel_group_name = sdsnew(argv[1]);
+
+            for (j = 2; j < argc-1; j+= 2) {
+                char *host = argv[j];
+                long port = atol(argv[j+1]);
+
+                if (port > 0) {
+                    sentinelInfo *info = (sentinelInfo*)zmalloc(sizeof(sentinelInfo));
+                    info->host = sdsnew(host);
+                    info->port = port;
+
+                    listAddNodeTail(server.sentinels, info);
+                }
+            }
+            server.sentinel_conn_state = REDIS_SENTINEL_CONNECT;
         } else if (!strcasecmp(argv[0],"repl-ping-slave-period") && argc == 2) {
             server.repl_ping_slave_period = atoi(argv[1]);
             if (server.repl_ping_slave_period <= 0) {

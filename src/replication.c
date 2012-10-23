@@ -30,6 +30,8 @@
 
 
 #include "redis.h"
+#include "hiredis.h"
+#include "async.h"
 
 #include <sys/time.h>
 #include <unistd.h>
@@ -335,6 +337,102 @@ void updateSlavesWaitingBgsave(int bgsaveerr) {
 
 /* ----------------------------------- SLAVE -------------------------------- */
 
+
+/* ======================= hiredis ae.c adapters =============================
+ * Note: this implementation is taken from hiredis/adapters/ae.h, however
+ * we have our modified copy for Sentinel in order to use our allocator
+ * and to have full control over how the adapter works. */
+
+typedef struct redisAeEvents {
+    redisAsyncContext *context;
+    aeEventLoop *loop;
+    int fd;
+    int reading, writing;
+} redisAeEvents;
+
+static void redisAeReadEvent(aeEventLoop *el, int fd, void *privdata, int mask) {
+    ((void)el); ((void)fd); ((void)mask);
+
+    redisAeEvents *e = (redisAeEvents*)privdata;
+    redisAsyncHandleRead(e->context);
+}
+
+static void redisAeWriteEvent(aeEventLoop *el, int fd, void *privdata, int mask) {
+    ((void)el); ((void)fd); ((void)mask);
+
+    redisAeEvents *e = (redisAeEvents*)privdata;
+    redisAsyncHandleWrite(e->context);
+}
+
+static void redisAeAddRead(void *privdata) {
+    redisAeEvents *e = (redisAeEvents*)privdata;
+    aeEventLoop *loop = e->loop;
+    if (!e->reading) {
+        e->reading = 1;
+        aeCreateFileEvent(loop,e->fd,AE_READABLE,redisAeReadEvent,e);
+    }
+}
+
+static void redisAeDelRead(void *privdata) {
+    redisAeEvents *e = (redisAeEvents*)privdata;
+    aeEventLoop *loop = e->loop;
+    if (e->reading) {
+        e->reading = 0;
+        aeDeleteFileEvent(loop,e->fd,AE_READABLE);
+    }
+}
+
+static void redisAeAddWrite(void *privdata) {
+    redisAeEvents *e = (redisAeEvents*)privdata;
+    aeEventLoop *loop = e->loop;
+    if (!e->writing) {
+        e->writing = 1;
+        aeCreateFileEvent(loop,e->fd,AE_WRITABLE,redisAeWriteEvent,e);
+    }
+}
+
+static void redisAeDelWrite(void *privdata) {
+    redisAeEvents *e = (redisAeEvents*)privdata;
+    aeEventLoop *loop = e->loop;
+    if (e->writing) {
+        e->writing = 0;
+        aeDeleteFileEvent(loop,e->fd,AE_WRITABLE);
+    }
+}
+
+static void redisAeCleanup(void *privdata) {
+    redisAeEvents *e = (redisAeEvents*)privdata;
+    redisAeDelRead(privdata);
+    redisAeDelWrite(privdata);
+    zfree(e);
+}
+
+static int redisAeAttach(aeEventLoop *loop, redisAsyncContext *ac) {
+    redisContext *c = &(ac->c);
+    redisAeEvents *e;
+
+    /* Nothing should be attached when something is already attached */
+    if (ac->ev.data != NULL)
+        return REDIS_ERR;
+
+    /* Create container for context and r/w events */
+    e = (redisAeEvents*)zmalloc(sizeof(*e));
+    e->context = ac;
+    e->loop = loop;
+    e->fd = c->fd;
+    e->reading = e->writing = 0;
+
+    /* Register functions to start/stop listening for events */
+    ac->ev.addRead = redisAeAddRead;
+    ac->ev.delRead = redisAeDelRead;
+    ac->ev.addWrite = redisAeAddWrite;
+    ac->ev.delWrite = redisAeDelWrite;
+    ac->ev.cleanup = redisAeCleanup;
+    ac->ev.data = e;
+
+    return REDIS_OK;
+}
+
 /* Abort the async download of the bulk dataset while SYNC-ing with master */
 void replicationAbortSyncTransfer(void) {
     redisAssert(server.repl_state == REDIS_REPL_TRANSFER);
@@ -344,6 +442,7 @@ void replicationAbortSyncTransfer(void) {
     close(server.repl_transfer_fd);
     unlink(server.repl_transfer_tmpfile);
     zfree(server.repl_transfer_tmpfile);
+
     server.repl_state = REDIS_REPL_CONNECT;
 }
 
@@ -518,6 +617,123 @@ char *sendSynchronousCommand(int fd, ...) {
     return NULL; /* No errors. */
 }
 
+void syncWithSentinelGetMasterAddressCallback(redisAsyncContext *c, void *r, void *privdata) {
+    redisReply *reply = NULL;
+    sentinelInfo *info = (sentinelInfo*)c->data;
+    if (server.sentinel_conn_state == REDIS_SENTINEL_RECEIVE_INFO) {
+        reply = (redisReply*)r;
+
+        if (reply == NULL)
+            goto error;
+
+        if (reply->type == REDIS_REPLY_NIL) {
+            redisLog(REDIS_WARNING, "Sentinel %s:%d has no master.", info->host, info->port);
+            goto error;
+        }
+
+        if (reply->type != REDIS_REPLY_ARRAY || reply->elements < 2) {
+            redisLog(REDIS_WARNING, "Expected array with host,port from sentinel %s:%d, got %s instead.", 
+                    info->host,
+                    info->port,
+                    reply->str);
+
+            goto error;
+        }
+
+        char *host = reply->element[0]->str;
+        long port = atol(reply->element[1]->str);
+
+        if (server.repl_state != REDIS_REPL_NONE && 
+            server.masterhost != NULL && 
+            strcmp(server.masterhost, host)==0 && 
+            port==server.masterport) 
+        {
+            redisLog(REDIS_NOTICE, "Our current master is in sync with sentinel %s:%d state.", info->host, info->port);
+
+        } else {
+            redisLog(REDIS_NOTICE, "Master for sentinel group %s is %s:%d", server.sentinel_group_name, host, port);
+
+            sdsfree(server.masterhost);
+            server.masterhost = sdsnew(host);
+            server.masterport = port;
+    
+            disconnectSlaves(); // Force our slaves to resync with us as well. 
+            if (server.repl_state == REDIS_REPL_TRANSFER)
+                replicationAbortSyncTransfer();                
+
+            server.repl_state = REDIS_REPL_CONNECT;
+
+            /* If we're unable to connect to this master, we should query the sentinel again before retrying
+               in case sentinel decided to fail-over to a new master. */
+            server.repl_reconnect_using_sentinel = 1; 
+
+            redisLog(REDIS_NOTICE,"SLAVE OF %s:%d enabled (sentinel-initiated)",
+                    server.masterhost, server.masterport);
+        }
+
+        server.sentinel_conn_state = REDIS_SENTINEL_NONE;
+        redisAsyncFree(server.sentinel_conn);
+        server.sentinel_conn = NULL;
+        info->status = REDIS_OK;
+        return;
+    }
+
+    return;
+
+error:
+    redisAsyncFree(server.sentinel_conn);
+    info->status = REDIS_ERR;
+    server.sentinel_conn = NULL;
+    server.sentinel_conn_state = REDIS_SENTINEL_CONNECT;
+
+    return;
+}
+
+void syncWithSentinelConnected(const redisAsyncContext *c, int status) {
+    /* If this event fired after the user turned the instance into a master
+     * with SLAVEOF NO ONE we must just return ASAP. */
+    if (server.sentinel_conn_state == REDIS_SENTINEL_NONE) {
+        redisAsyncFree(server.sentinel_conn);
+        server.sentinel_conn = NULL;
+        return;
+    }
+
+    if (status != REDIS_OK) {
+        redisLog(REDIS_WARNING,"Error condition on socket for sentinel INFO: %s", c->errstr);
+        goto error;
+    }
+
+    if (server.sentinel_conn_state == REDIS_SENTINEL_CONNECTING) {
+        server.repl_sentinel_last_io = time(NULL);
+
+        redisAsyncCommand(server.sentinel_conn, 
+                          syncWithSentinelGetMasterAddressCallback, 
+                          NULL, 
+                          "sentinel get-master-addr-by-name %s", 
+                          server.sentinel_group_name);
+
+        server.sentinel_conn_state = REDIS_SENTINEL_RECEIVE_INFO;
+    }
+
+    return;
+
+error:
+//    redisAsyncFree(server.sentinel_conn);
+    ((sentinelInfo*)(c->data))->status = REDIS_ERR;
+
+    server.sentinel_conn = NULL;
+    
+    server.sentinel_conn_state = REDIS_SENTINEL_CONNECT;
+
+}
+
+void syncWithSentinelDisconnected(const redisAsyncContext *c, int status) {
+    if (status != REDIS_OK && server.sentinel_conn_state != REDIS_SENTINEL_NONE) {
+        server.sentinel_conn_state = REDIS_SENTINEL_CONNECT;
+        server.sentinel_conn = NULL;
+    }
+}
+
 void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
     char tmpfile[256], *err;
     int dfd, maxtries = 5;
@@ -651,6 +867,7 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
         goto error;
     }
 
+    server.repl_reconnect_using_sentinel = 0; 
     server.repl_state = REDIS_REPL_TRANSFER;
     server.repl_transfer_size = -1;
     server.repl_transfer_read = 0;
@@ -663,8 +880,79 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
 error:
     close(fd);
     server.repl_transfer_s = -1;
-    server.repl_state = REDIS_REPL_CONNECT;
+
+    if (server.repl_reconnect_using_sentinel) {
+        /* Master connection failed, ask sentinel for a new master */
+        server.sentinel_conn_state = REDIS_SENTINEL_CONNECT;
+        server.repl_state = REDIS_REPL_NONE;
+    }
+    else
+        server.repl_state = REDIS_REPL_CONNECT;
+
     return;
+}
+
+int connectWithSentinel(void) {
+    listNode *node = NULL;
+    sentinelInfo *info = NULL;
+   
+    if (server.sentinels == NULL) {
+        redisLog(REDIS_WARNING, "Unable to connect to sentinel because the list is NULL.");
+        return REDIS_ERR;
+    }
+
+    if (server.sentinel_iterator == NULL) {
+        server.sentinel_iterator = listGetIterator(server.sentinels, AL_START_HEAD);
+    }
+
+        
+    node = server.sentinel_iterator->next;   
+
+    info = node ? (sentinelInfo*)node->value : NULL;
+
+    /* If we failed to connect to this sentinel, move on to the next one */
+    if (info && info->status == REDIS_ERR) {
+        info->status = REDIS_OK;
+
+        listNext(server.sentinel_iterator);
+        node = server.sentinel_iterator->next;
+    }
+
+    if (node == NULL) {
+        listRewind(server.sentinels, server.sentinel_iterator);
+        node = listNext(server.sentinel_iterator);
+
+        if (node == NULL) {
+            redisLog(REDIS_WARNING, "Unable to connect to sentinel because the list is empty.");
+            return REDIS_ERR;
+        }
+    }
+
+    info = (sentinelInfo*)node->value;
+
+    redisLog(REDIS_NOTICE, "Connecting to sentinel %s:%d...", info->host, info->port);
+    redisAsyncContext *c = redisAsyncConnect(info->host, info->port);
+
+    if (c->err) {
+        redisLog(REDIS_WARNING,"Unable to connect to sentinel: %s",
+                 c->errstr);
+    
+        redisAsyncFree(c);
+        return REDIS_ERR;
+    }
+
+    server.repl_sentinel_last_io = time(NULL);
+
+    c->data = info;
+
+    redisAeAttach(server.el, c);
+    redisAsyncSetConnectCallback(c, syncWithSentinelConnected);
+    redisAsyncSetDisconnectCallback(c, syncWithSentinelDisconnected);
+    
+    server.sentinel_conn_state = REDIS_SENTINEL_CONNECTING;    
+    server.sentinel_conn = c;
+
+    return REDIS_OK;
 }
 
 int connectWithMaster(void) {
@@ -677,6 +965,7 @@ int connectWithMaster(void) {
         return REDIS_ERR;
     }
 
+    
     if (aeCreateFileEvent(server.el,fd,AE_READABLE|AE_WRITABLE,syncWithMaster,NULL) ==
             AE_ERR)
     {
@@ -701,7 +990,110 @@ void undoConnectWithMaster(void) {
     aeDeleteFileEvent(server.el,fd,AE_READABLE|AE_WRITABLE);
     close(fd);
     server.repl_transfer_s = -1;
-    server.repl_state = REDIS_REPL_CONNECT;
+
+    /* If this connection was initiated by sentinel, re-connect to sentinel and find out if we have a new master */
+    if (server.repl_reconnect_using_sentinel)
+    {
+        server.sentinel_conn_state = REDIS_SENTINEL_CONNECT;
+        server.repl_state = REDIS_REPL_NONE;
+    }
+    else
+        server.repl_state = REDIS_REPL_CONNECT;
+}
+
+void undoConnectWithSentinel(void) {
+    if (server.sentinel_conn) {
+        redisAsyncFree(server.sentinel_conn);
+        server.sentinel_conn = NULL;
+    }
+    
+    server.sentinel_conn_state = REDIS_SENTINEL_CONNECT;
+}
+
+void sentinelsCommand(redisClient *c) {
+    int j=1;
+    
+    if (strcasecmp(c->argv[1]->ptr, "no")==0 && strcasecmp(c->argv[2]->ptr, "one")==0) {
+        undoConnectWithSentinel();
+        server.repl_reconnect_using_sentinel = 0;
+        server.sentinel_conn_state = REDIS_SENTINEL_NONE;
+
+        addReply(c,shared.ok);
+        return;
+    }
+
+    if (((c->argc-1) % 2) == 0) {
+        addReplyError(c,"wrong number of arguments");
+        return;
+    }
+
+    // Free the old sentinel list and it's iterator
+    if (server.sentinels != NULL) {
+        listIter* iter = listGetIterator(server.sentinels, AL_START_HEAD);
+
+        if (iter != NULL) {
+            listNode *node = NULL;
+
+            while ((node = listNext(iter)) != NULL) {
+                sentinelInfo *s = (sentinelInfo*)node->value;
+
+                sdsfree(s->host);
+            }
+        }
+
+        listReleaseIterator(server.sentinel_iterator);
+        listRelease(server.sentinels);
+        
+        server.sentinels = NULL;
+        server.sentinel_iterator = NULL;
+    }
+
+    server.sentinel_conn_state = REDIS_SENTINEL_NONE;    
+
+    sdsfree(server.sentinel_group_name);
+    server.sentinel_group_name = NULL;
+
+    server.sentinel_group_name = sdsnew(c->argv[1]->ptr);
+
+    for (j=2; j < c->argc-1; j+=2) {
+    
+        long port = 0;
+
+        if ((getLongFromObjectOrReply(c, c->argv[j+1], &port, NULL) != REDIS_OK))
+            break;
+
+        if (server.sentinels == NULL) {
+            server.sentinels = listCreate();
+        }
+
+        sentinelInfo *info = (sentinelInfo*)zmalloc(sizeof(sentinelInfo));
+
+        if (!info) {
+            redisLog(REDIS_WARNING, "Out of memory!");
+            return;
+        }
+
+        info->host = sdsnew(c->argv[j]->ptr);
+        info->port = (int)port;
+
+        if (listAddNodeTail(server.sentinels, info) == NULL) {
+            redisLog(REDIS_WARNING, "Failed to add sentinel to adlist");
+
+            sdsfree(info->host);
+            zfree(info);
+
+            break;
+        }
+    
+        redisLog(REDIS_NOTICE,"Now following sentinel %s:%d",
+            info->host, info->port);
+        
+        if (server.sentinel_conn_state == REDIS_SENTINEL_NONE) {
+            server.sentinel_conn_state = REDIS_SENTINEL_CONNECT;
+        }
+    }
+
+    addReply(c,shared.ok);
 }
 
 /* This function aborts a non blocking replication attempt if there is one
@@ -727,15 +1119,23 @@ int cancelReplicationHandshake(void) {
 
 void slaveofCommand(redisClient *c) {
     if (!strcasecmp(c->argv[1]->ptr,"no") &&
-        !strcasecmp(c->argv[2]->ptr,"one")) {
+        !strcasecmp(c->argv[2]->ptr,"one")) 
+    {
+        if (server.sentinel_conn_state != REDIS_SENTINEL_NONE) {
+            undoConnectWithSentinel();
+            server.sentinel_conn_state = REDIS_SENTINEL_NONE;
+        }
+
         if (server.masterhost) {
             sdsfree(server.masterhost);
             server.masterhost = NULL;
             if (server.master) freeClient(server.master);
             cancelReplicationHandshake();
             server.repl_state = REDIS_REPL_NONE;
+            server.repl_reconnect_using_sentinel = 0;
             redisLog(REDIS_NOTICE,"MASTER MODE enabled (user request)");
         }
+
     } else {
         long port;
 
@@ -754,6 +1154,7 @@ void slaveofCommand(redisClient *c) {
         sdsfree(server.masterhost);
         server.masterhost = sdsdup(c->argv[1]->ptr);
         server.masterport = port;
+        server.repl_reconnect_using_sentinel = 0;
         if (server.master) freeClient(server.master);
         disconnectSlaves(); /* Force our slaves to resync with us as well. */
         cancelReplicationHandshake();
@@ -777,6 +1178,15 @@ void replicationCron(void) {
         undoConnectWithMaster();
     }
 
+    /* Connect to sentinel timeout? */
+    if (server.sentinels && (server.sentinel_conn_state == REDIS_SENTINEL_CONNECTING ||
+        server.sentinel_conn_state == REDIS_SENTINEL_RECEIVE_INFO) &&
+        (time(NULL)-server.repl_sentinel_last_io > server.repl_timeout))
+    {
+        redisLog(REDIS_WARNING, "Timeout waiting for data from sentinel... If the problem persists try to set the 'repl-timeout' parameter in redis.conf to a larger value.");
+        undoConnectWithSentinel();
+    }
+
     /* Bulk transfer I/O timeout? */
     if (server.masterhost && server.repl_state == REDIS_REPL_TRANSFER &&
         (time(NULL)-server.repl_transfer_lastio) > server.repl_timeout)
@@ -793,6 +1203,13 @@ void replicationCron(void) {
         freeClient(server.master);
     }
 
+    /* Check if we should follow a sentinel */
+    if (server.sentinel_conn_state == REDIS_SENTINEL_CONNECT) {
+        redisLog(REDIS_NOTICE, "Following a sentinel...");
+        if (connectWithSentinel() == REDIS_OK) {
+            redisLog(REDIS_NOTICE, "Sentinel sync started");
+        }
+    }
     /* Check if we should connect to a MASTER */
     if (server.repl_state == REDIS_REPL_CONNECT) {
         redisLog(REDIS_NOTICE,"Connecting to MASTER...");

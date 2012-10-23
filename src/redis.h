@@ -207,6 +207,14 @@
 #define REDIS_REPL_TRANSFER 4 /* Receiving .rdb from master */
 #define REDIS_REPL_CONNECTED 5 /* Connected to master */
 
+/* Sentinel follow state - slave side */
+#define REDIS_SENTINEL_NONE 0
+#define REDIS_SENTINEL_CONNECT 1
+#define REDIS_SENTINEL_CONNECTING 2
+#define REDIS_SENTINEL_RECEIVE_PONG 3
+#define REDIS_SENTINEL_RECEIVE_INFO 4
+
+
 /* Synchronous read timeout - slave side */
 #define REDIS_REPL_SYNCIO_TIMEOUT 5
 
@@ -331,6 +339,14 @@ typedef struct redisObject {
     _var.encoding = REDIS_ENCODING_RAW; \
     _var.ptr = _ptr; \
 } while(0);
+
+/* Used for sentinel following */
+typedef struct sentinelInfo {
+    char *host;
+    int port;
+    int status;
+
+} sentinelInfo;
 
 typedef struct redisDb {
     dict *dict;                 /* The keyspace for this DB */
@@ -610,6 +626,13 @@ struct redisServer {
     char *masterauth;               /* AUTH with this password with master */
     char *masterhost;               /* Hostname of master */
     int masterport;                 /* Port of master */
+    int repl_reconnect_using_sentinel; /* Reconnect to master using sentinel (if master connection failed) */
+    time_t repl_sentinel_last_io;   /* Unix time of the last network activity, for timeout */
+    list *sentinels;                /* List of possible sentinels we can follow */    
+    listIter *sentinel_iterator;    /* Sentinels list iterator for round-robin */
+    char *sentinel_group_name;      /* Name of the group we follow */
+    int sentinel_conn_state;        /* Sentinel connection state */
+    void *sentinel_conn;            /* Sentinel connection (redisAsyncContext) */
     int repl_ping_slave_period;     /* Master pings the slave every N seconds */
     int repl_timeout;               /* Timeout after N seconds of master idle */
     redisClient *master;     /* Client that is master for this slave */
@@ -1133,6 +1156,7 @@ void getsetCommand(redisClient *c);
 void ttlCommand(redisClient *c);
 void pttlCommand(redisClient *c);
 void persistCommand(redisClient *c);
+void sentinelsCommand(redisClient *c);
 void slaveofCommand(redisClient *c);
 void debugCommand(redisClient *c);
 void msetCommand(redisClient *c);
