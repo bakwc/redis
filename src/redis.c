@@ -1239,7 +1239,7 @@ void initServerConfig() {
     server.sentinels = NULL;
     server.sentinel_iterator = NULL;
     server.sentinel_conn = NULL;
-    server.sentinel_group_name = NULL;
+    server.sentinel_master_name = NULL;
     server.sentinel_conn_state = REDIS_SENTINEL_NONE;
     server.repl_reconnect_using_sentinel = 0;
     server.repl_sentinel_last_io = 0;
@@ -2211,7 +2211,7 @@ sds genRedisInfoString(char *section) {
                 listNode *node = NULL;
                 int i = 0;
 
-                info = sdscatprintf(info, "sentinel_group:%s\r\n", server.sentinel_group_name);
+                info = sdscatprintf(info, "sentinel_master:%s\r\n", server.sentinel_master_name);
 
                 listRewind(server.sentinels, &li);
 

@@ -617,9 +617,12 @@ char *sendSynchronousCommand(int fd, ...) {
     return NULL; /* No errors. */
 }
 
+/* Callback for 'get-master-by-addr' from sentinel.
+ * Response should contain a master address (host,port)
+*/
 void syncWithSentinelGetMasterAddressCallback(redisAsyncContext *c, void *r, void *privdata) {
     redisReply *reply = NULL;
-    sentinelInfo *info = (sentinelInfo*)c->data;
+    sentinelInfo *sentinel = (sentinelInfo*)c->data;
     if (server.sentinel_conn_state == REDIS_SENTINEL_RECEIVE_INFO) {
         reply = (redisReply*)r;
 
@@ -627,14 +630,14 @@ void syncWithSentinelGetMasterAddressCallback(redisAsyncContext *c, void *r, voi
             goto error;
 
         if (reply->type == REDIS_REPLY_NIL) {
-            redisLog(REDIS_WARNING, "Sentinel %s:%d has no master.", info->host, info->port);
+            redisLog(REDIS_WARNING, "Sentinel %s:%d has no master.", sentinel->host, sentinel->port);
             goto error;
         }
 
         if (reply->type != REDIS_REPLY_ARRAY || reply->elements < 2) {
             redisLog(REDIS_WARNING, "Expected array with host,port from sentinel %s:%d, got %s instead.", 
-                    info->host,
-                    info->port,
+                    sentinel->host,
+                    sentinel->port,
                     reply->str);
 
             goto error;
@@ -648,10 +651,10 @@ void syncWithSentinelGetMasterAddressCallback(redisAsyncContext *c, void *r, voi
             strcmp(server.masterhost, host)==0 && 
             port==server.masterport) 
         {
-            redisLog(REDIS_NOTICE, "Our current master is in sync with sentinel %s:%d state.", info->host, info->port);
+            redisLog(REDIS_NOTICE, "Our current master is in sync with sentinel %s:%d state.", sentinel->host, sentinel->port);
 
         } else {
-            redisLog(REDIS_NOTICE, "Master for sentinel group %s is %s:%d", server.sentinel_group_name, host, port);
+            redisLog(REDIS_NOTICE, "Master for sentinel group %s is %s:%d", server.sentinel_master_name, host, port);
 
             sdsfree(server.masterhost);
             server.masterhost = sdsnew(host);
@@ -674,7 +677,7 @@ void syncWithSentinelGetMasterAddressCallback(redisAsyncContext *c, void *r, voi
         server.sentinel_conn_state = REDIS_SENTINEL_NONE;
         redisAsyncFree(server.sentinel_conn);
         server.sentinel_conn = NULL;
-        info->status = REDIS_OK;
+        sentinel->status = REDIS_OK;
         return;
     }
 
@@ -682,11 +685,18 @@ void syncWithSentinelGetMasterAddressCallback(redisAsyncContext *c, void *r, voi
 
 error:
     redisAsyncFree(server.sentinel_conn);
-    info->status = REDIS_ERR;
+    sentinel->status = REDIS_ERR;
     server.sentinel_conn = NULL;
     server.sentinel_conn_state = REDIS_SENTINEL_CONNECT;
 
     return;
+}
+
+void syncWithSentinelDisconnected(const redisAsyncContext *c, int status) {
+    if (status != REDIS_OK && server.sentinel_conn_state != REDIS_SENTINEL_NONE) {
+        server.sentinel_conn_state = REDIS_SENTINEL_CONNECT;
+        server.sentinel_conn = NULL;
+    }
 }
 
 void syncWithSentinelConnected(const redisAsyncContext *c, int status) {
@@ -710,7 +720,7 @@ void syncWithSentinelConnected(const redisAsyncContext *c, int status) {
                           syncWithSentinelGetMasterAddressCallback, 
                           NULL, 
                           "sentinel get-master-addr-by-name %s", 
-                          server.sentinel_group_name);
+                          server.sentinel_master_name);
 
         server.sentinel_conn_state = REDIS_SENTINEL_RECEIVE_INFO;
     }
@@ -718,20 +728,12 @@ void syncWithSentinelConnected(const redisAsyncContext *c, int status) {
     return;
 
 error:
-//    redisAsyncFree(server.sentinel_conn);
     ((sentinelInfo*)(c->data))->status = REDIS_ERR;
 
     server.sentinel_conn = NULL;
     
     server.sentinel_conn_state = REDIS_SENTINEL_CONNECT;
 
-}
-
-void syncWithSentinelDisconnected(const redisAsyncContext *c, int status) {
-    if (status != REDIS_OK && server.sentinel_conn_state != REDIS_SENTINEL_NONE) {
-        server.sentinel_conn_state = REDIS_SENTINEL_CONNECT;
-        server.sentinel_conn = NULL;
-    }
 }
 
 void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
@@ -894,7 +896,7 @@ error:
 
 int connectWithSentinel(void) {
     listNode *node = NULL;
-    sentinelInfo *info = NULL;
+    sentinelInfo *sentinel = NULL;
    
     if (server.sentinels == NULL) {
         redisLog(REDIS_WARNING, "Unable to connect to sentinel because the list is NULL.");
@@ -908,11 +910,11 @@ int connectWithSentinel(void) {
         
     node = server.sentinel_iterator->next;   
 
-    info = node ? (sentinelInfo*)node->value : NULL;
+    sentinel = node ? (sentinelInfo*)node->value : NULL;
 
     /* If we failed to connect to this sentinel, move on to the next one */
-    if (info && info->status == REDIS_ERR) {
-        info->status = REDIS_OK;
+    if (sentinel && sentinel->status == REDIS_ERR) {
+        sentinel->status = REDIS_OK;
 
         listNext(server.sentinel_iterator);
         node = server.sentinel_iterator->next;
@@ -928,10 +930,10 @@ int connectWithSentinel(void) {
         }
     }
 
-    info = (sentinelInfo*)node->value;
+    sentinel = (sentinelInfo*)node->value;
 
-    redisLog(REDIS_NOTICE, "Connecting to sentinel %s:%d...", info->host, info->port);
-    redisAsyncContext *c = redisAsyncConnect(info->host, info->port);
+    redisLog(REDIS_NOTICE, "Connecting to sentinel %s:%d...", sentinel->host, sentinel->port);
+    redisAsyncContext *c = redisAsyncConnect(sentinel->host, sentinel->port);
 
     if (c->err) {
         redisLog(REDIS_WARNING,"Unable to connect to sentinel: %s",
@@ -943,7 +945,7 @@ int connectWithSentinel(void) {
 
     server.repl_sentinel_last_io = time(NULL);
 
-    c->data = info;
+    c->data = sentinel;
 
     redisAeAttach(server.el, c);
     redisAsyncSetConnectCallback(c, syncWithSentinelConnected);
@@ -1048,12 +1050,10 @@ void sentinelsCommand(redisClient *c) {
         server.sentinel_iterator = NULL;
     }
 
-    server.sentinel_conn_state = REDIS_SENTINEL_NONE;    
-
-    sdsfree(server.sentinel_group_name);
-    server.sentinel_group_name = NULL;
-
-    server.sentinel_group_name = sdsnew(c->argv[1]->ptr);
+    server.sentinel_conn_state = REDIS_SENTINEL_NONE;
+    sdsfree(server.sentinel_master_name);
+    server.sentinel_master_name = NULL;
+    server.sentinel_master_name = sdsnew(c->argv[1]->ptr);
 
     for (j=2; j < c->argc-1; j+=2) {
     
@@ -1066,31 +1066,30 @@ void sentinelsCommand(redisClient *c) {
             server.sentinels = listCreate();
         }
 
-        sentinelInfo *info = (sentinelInfo*)zmalloc(sizeof(sentinelInfo));
+        sentinelInfo *sentinel = (sentinelInfo*)zmalloc(sizeof(sentinelInfo));
 
-        if (!info) {
+        if (!sentinel) {
             redisLog(REDIS_WARNING, "Out of memory!");
             return;
         }
 
-        info->host = sdsnew(c->argv[j]->ptr);
-        info->port = (int)port;
+        sentinel->host = sdsnew(c->argv[j]->ptr);
+        sentinel->port = (int)port;
 
-        if (listAddNodeTail(server.sentinels, info) == NULL) {
+        if (listAddNodeTail(server.sentinels, sentinel) == NULL) {
             redisLog(REDIS_WARNING, "Failed to add sentinel to adlist");
 
-            sdsfree(info->host);
-            zfree(info);
+            sdsfree(sentinel->host);
+            zfree(sentinel);
 
             break;
         }
     
         redisLog(REDIS_NOTICE,"Now following sentinel %s:%d",
-            info->host, info->port);
+            sentinel->host, sentinel->port);
         
-        if (server.sentinel_conn_state == REDIS_SENTINEL_NONE) {
+        if (server.sentinel_conn_state == REDIS_SENTINEL_NONE) 
             server.sentinel_conn_state = REDIS_SENTINEL_CONNECT;
-        }
     }
 
     addReply(c,shared.ok);

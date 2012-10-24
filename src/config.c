@@ -236,7 +236,7 @@ void loadServerConfigFromString(char *config) {
         } else if (!strcasecmp(argv[0],"sentinels") && argc >= 4) {
             int j = 0;
             server.sentinels = listCreate();
-            server.sentinel_group_name = sdsnew(argv[1]);
+            server.sentinel_master_name = sdsnew(argv[1]);
 
             for (j = 2; j < argc-1; j+= 2) {
                 char *host = argv[j];

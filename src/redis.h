@@ -630,7 +630,7 @@ struct redisServer {
     time_t repl_sentinel_last_io;   /* Unix time of the last network activity, for timeout */
     list *sentinels;                /* List of possible sentinels we can follow */    
     listIter *sentinel_iterator;    /* Sentinels list iterator for round-robin */
-    char *sentinel_group_name;      /* Name of the group we follow */
+    char *sentinel_master_name;     /* Name of the sentinel master we follow */
     int sentinel_conn_state;        /* Sentinel connection state */
     void *sentinel_conn;            /* Sentinel connection (redisAsyncContext) */
     int repl_ping_slave_period;     /* Master pings the slave every N seconds */
