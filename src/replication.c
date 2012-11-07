@@ -38,6 +38,10 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <arpa/inet.h>
+
+/* Prototyping */
+void syncWithSentinelConnected(const redisAsyncContext *c, int status);
 
 /* ---------------------------------- MASTER -------------------------------- */
 
@@ -617,25 +621,31 @@ char *sendSynchronousCommand(int fd, ...) {
     return NULL; /* No errors. */
 }
 
-/* Callback for 'get-master-by-addr' from sentinel.
- * Response should contain a master address (host,port)
+/* Callback for 'group join' from sentinel.
+ * Response might contain a PENDING status, TRYAGAIN status or a response telling us we are master or slaves.
 */
-void syncWithSentinelGetMasterAddressCallback(redisAsyncContext *c, void *r, void *privdata) {
+void syncWithSentinelJoinGroupCallback(redisAsyncContext *c, void *r, void *privdata) {
     redisReply *reply = NULL;
     sentinelInfo *sentinel = (sentinelInfo*)c->data;
-    if (server.sentinel_conn_state == REDIS_SENTINEL_RECEIVE_INFO) {
+    if (server.sentinel_conn_state == REDIS_SENTINEL_RECEIVE_JOIN) {
         reply = (redisReply*)r;
 
         if (reply == NULL)
             goto error;
 
         if (reply->type == REDIS_REPLY_NIL) {
-            redisLog(REDIS_WARNING, "Sentinel %s:%d has no master.", sentinel->host, sentinel->port);
+            redisLog(REDIS_WARNING, "Sentinel %s:%d told me nothing.", sentinel->host, sentinel->port);
             goto error;
         }
 
-        if (reply->type != REDIS_REPLY_ARRAY || reply->elements < 2) {
-            redisLog(REDIS_WARNING, "Expected array with host,port from sentinel %s:%d, got %s instead.", 
+
+        if (reply->type == REDIS_REPLY_ERROR || (reply->type == REDIS_REPLY_STATUS && strstr(reply->str, "PENDING") != NULL)) {                        
+            server.sentinel_conn_state = REDIS_SENTINEL_RETRY_JOIN;            
+            return;
+        }
+        
+        if (reply->type != REDIS_REPLY_ARRAY || reply->elements < 1) {
+            redisLog(REDIS_WARNING, "Expected array with (type) or (type,host,port) from sentinel %s:%d, got %s instead.", 
                     sentinel->host,
                     sentinel->port,
                     reply->str);
@@ -643,37 +653,43 @@ void syncWithSentinelGetMasterAddressCallback(redisAsyncContext *c, void *r, voi
             goto error;
         }
 
-        char *host = reply->element[0]->str;
-        long port = atol(reply->element[1]->str);
+        char *type = reply->element[0]->str;
+        if (strcasecmp(type, "master") == 0) {
+            // Sentinel appointed me as master
+            redisLog(REDIS_NOTICE, "I am now the master of sentinel group %s", server.sentinel_master_name);
+        } else if (strcasecmp(type, "slave") == 0 && reply->elements == 3) {
+            char *host = reply->element[1]->str;
+            long port = atol(reply->element[2]->str);            
 
-        if (server.repl_state != REDIS_REPL_NONE && 
-            server.masterhost != NULL && 
-            strcmp(server.masterhost, host)==0 && 
-            port==server.masterport) 
-        {
-            redisLog(REDIS_NOTICE, "Our current master is in sync with sentinel %s:%d state.", sentinel->host, sentinel->port);
+            if (server.repl_state != REDIS_REPL_NONE && 
+                server.masterhost != NULL && 
+                strcmp(server.masterhost, host)==0 && 
+                port==server.masterport) 
+            {
+                redisLog(REDIS_NOTICE, "Our current master is in sync with sentinel %s:%d state.", sentinel->host, sentinel->port);
 
-        } else {
-            redisLog(REDIS_NOTICE, "Master for sentinel group %s is %s:%d", server.sentinel_master_name, host, port);
+            } else {
+                redisLog(REDIS_NOTICE, "Master for sentinel group %s is %s:%d", server.sentinel_master_name, host, port);
 
-            sdsfree(server.masterhost);
-            server.masterhost = sdsnew(host);
-            server.masterport = port;
-    
-            disconnectSlaves(); // Force our slaves to resync with us as well. 
-            if (server.repl_state == REDIS_REPL_TRANSFER)
-                replicationAbortSyncTransfer();                
+                sdsfree(server.masterhost);
+                server.masterhost = sdsnew(host);
+                server.masterport = port;
 
-            server.repl_state = REDIS_REPL_CONNECT;
+                disconnectSlaves(); // Force our slaves to resync with us as well. 
+                if (server.repl_state == REDIS_REPL_TRANSFER)
+                    replicationAbortSyncTransfer();                
 
-            /* If we're unable to connect to this master, we should query the sentinel again before retrying
-               in case sentinel decided to fail-over to a new master. */
-            server.repl_reconnect_using_sentinel = 1; 
+                server.repl_state = REDIS_REPL_CONNECT;
 
-            redisLog(REDIS_NOTICE,"SLAVE OF %s:%d enabled (sentinel-initiated)",
-                    server.masterhost, server.masterport);
+                /* If we're unable to connect to this master, we should query the sentinel again before retrying
+                   in case sentinel decided to fail-over to a new master. */
+                server.repl_reconnect_using_sentinel = 1; 
+
+                redisLog(REDIS_NOTICE,"SLAVE OF %s:%d enabled (sentinel-initiated)",
+                        server.masterhost, server.masterport);
+            }
         }
-
+        
         server.sentinel_conn_state = REDIS_SENTINEL_NONE;
         redisAsyncFree(server.sentinel_conn);
         server.sentinel_conn = NULL;
@@ -709,20 +725,23 @@ void syncWithSentinelConnected(const redisAsyncContext *c, int status) {
     }
 
     if (status != REDIS_OK) {
-        redisLog(REDIS_WARNING,"Error condition on socket for sentinel INFO: %s", c->errstr);
+        redisLog(REDIS_WARNING,"Error condition on socket for sentinel group join: %s", c->errstr);
         goto error;
     }
 
     if (server.sentinel_conn_state == REDIS_SENTINEL_CONNECTING) {
         server.repl_sentinel_last_io = time(NULL);
-
-        redisAsyncCommand(server.sentinel_conn, 
-                          syncWithSentinelGetMasterAddressCallback, 
-                          NULL, 
-                          "sentinel get-master-addr-by-name %s", 
-                          server.sentinel_master_name);
-
-        server.sentinel_conn_state = REDIS_SENTINEL_RECEIVE_INFO;
+        struct sockaddr_in sa;
+        socklen_t salen = sizeof(sa);
+        
+        if (getsockname(c->c.fd,(struct sockaddr*)&sa,&salen) != -1) {            
+            redisAsyncCommand(server.sentinel_conn, 
+                      syncWithSentinelJoinGroupCallback, 
+                      NULL, 
+                      "sentinel group join %s %s %d", 
+                      server.sentinel_master_name, inet_ntoa(sa.sin_addr), server.port);
+            server.sentinel_conn_state = REDIS_SENTINEL_RECEIVE_JOIN;
+        }
     }
 
     return;
@@ -733,7 +752,6 @@ error:
     server.sentinel_conn = NULL;
     
     server.sentinel_conn_state = REDIS_SENTINEL_CONNECT;
-
 }
 
 void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
@@ -1179,11 +1197,20 @@ void replicationCron(void) {
 
     /* Connect to sentinel timeout? */
     if (server.sentinels && (server.sentinel_conn_state == REDIS_SENTINEL_CONNECTING ||
-        server.sentinel_conn_state == REDIS_SENTINEL_RECEIVE_INFO) &&
+        server.sentinel_conn_state == REDIS_SENTINEL_RECEIVE_JOIN) &&
         (time(NULL)-server.repl_sentinel_last_io > server.repl_timeout))
     {
         redisLog(REDIS_WARNING, "Timeout waiting for data from sentinel... If the problem persists try to set the 'repl-timeout' parameter in redis.conf to a larger value.");
         undoConnectWithSentinel();
+    }
+    
+    /* Retry join sentinel group? */    
+    if (server.sentinels && (server.sentinel_conn_state == REDIS_SENTINEL_RETRY_JOIN &&
+        (time(NULL)-server.repl_sentinel_last_io >= 1)))
+    {
+        redisLog(REDIS_WARNING, "Retrying to join sentinel group %s", server.sentinel_master_name);
+        server.sentinel_conn_state = REDIS_SENTINEL_CONNECTING;
+        syncWithSentinelConnected(server.sentinel_conn, REDIS_OK);
     }
 
     /* Bulk transfer I/O timeout? */

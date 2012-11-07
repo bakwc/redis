@@ -119,7 +119,7 @@ typedef struct sentinelAddr {
 #define SENTINEL_QUORUM_STATE_PENDING_LOCK 1 /* Lock request sent to all sentinels */
 #define SENTINEL_QUORUM_STATE_ACQUIRED_LOCK 2 /* All sentinels accepted our lock */
 #define SENTINEL_QUORUM_STATE_UPDATING_SENTINELS 3 /* Sent new group information to all sentinels */
-#define SENTINEL_DYNAMIC_GROUP_NAME "__sentinels__" /* Name of the sentinel's fake master name */
+#define SENTINEL_QUORUM_GROUP_NAME "__sentinels__" /* Name of the sentinel's fake master name */
 
 #define SENTINEL_MASTER_LINK_STATUS_UP 0
 #define SENTINEL_MASTER_LINK_STATUS_DOWN 1
@@ -165,7 +165,7 @@ typedef struct sentinelRedisInstance {
     mstime_t s_down_since_time; /* Subjectively down since time. */
     mstime_t o_down_since_time; /* Objectively down since time. */
     mstime_t down_after_period; /* Consider it down after that period. */
-    mstime_t info_refresh;  /* Time at which we received INFO output from it. */
+    mstime_t info_refresh;  /* Time at which we received INFO output from it. */    
 
     /* Master specific. */
     dict *sentinels;    /* Other sentinels monitoring the same master. */
@@ -231,9 +231,8 @@ struct sentinelState {
                            Key is the instance name, value is the
                            sentinelRedisInstance structure pointer. */
 
-    dict *sentinels;    /* Known sentinels monitoring one or more of our masters
-                         * This points to the sri->sentinels of the SENTINEL_DYNAMIC_GROUP_NAME master
-                         */
+    sentinelRedisInstance *group_master;
+
     dict *group_locks; /* Group lock requests for quorum (incoming) */
     dict *group_requests; /* Pending group requests (outgoing) */
 
@@ -492,11 +491,11 @@ void initSentinel(void) {
     sentinel.running_scripts = 0;
     sentinel.scripts_queue = listCreate();
 
-    /* Create the SENTINEL_DYNAMIC_GROUP_NAME master
+    /* Create the SENTINEL_QUORUM_GROUP_NAME master
      * and point sentinel.sentinels to it's sentinels.
      */
-    sentinelRedisInstance *ri = createSentinelRedisInstance(SENTINEL_DYNAMIC_GROUP_NAME, SRI_MASTER, SENTINEL_DYNAMIC_GROUP_NAME, 1, 3, NULL);
-    sentinel.sentinels = ri->sentinels;
+    sentinelRedisInstance *ri = createSentinelRedisInstance(SENTINEL_QUORUM_GROUP_NAME, SRI_MASTER, SENTINEL_QUORUM_GROUP_NAME, 1, 3, NULL);
+    sentinel.group_master = ri;
 }
 
 sentinelGroupLock *getGroupLockByName(char *name) {
@@ -616,8 +615,8 @@ sentinelAddr *createSentinelAddr(char *hostname, int port) {
         errno = EINVAL;
         return NULL;
     }
-    /* Hack for SENTINEL_DYNAMIC_GROUP_NAME group */
-    int isInternal = strcasecmp(hostname, SENTINEL_DYNAMIC_GROUP_NAME) == 0 ? 1 : 0;
+    /* Hack for SENTINEL_QUORUM_GROUP_NAME group */
+    int isInternal = strcasecmp(hostname, SENTINEL_QUORUM_GROUP_NAME) == 0 ? 1 : 0;
 
     if (isInternal == 0 && anetResolve(NULL,hostname,buf) == ANET_ERR) {
         errno = ENOENT;
@@ -1084,8 +1083,8 @@ sentinelRedisInstance *createSentinelRedisInstance(char *name, int flags, char *
     ri->parallel_syncs = SENTINEL_DEFAULT_PARALLEL_SYNCS;
     ri->master = master;
     ri->slaves = dictCreate(&instancesDictType,NULL);
-    ri->info_refresh = 0;
-
+    ri->info_refresh = 0;    
+    
     /* Failover state. */
     ri->leader = NULL;
     ri->failover_state = SENTINEL_FAILOVER_STATE_NONE;
@@ -1362,13 +1361,12 @@ char *sentinelHandleConfiguration(char **argv, int argc) {
             }
         }
     } else if (!strcasecmp(argv[0], "cluster") && argc>=4) {
-        ri = sentinelGetMasterByName(SENTINEL_DYNAMIC_GROUP_NAME);
         int quorum = atoi(argv[1]);
-        ri->quorum = quorum;
+        sentinel.group_master->quorum = quorum;        
 
         for (int i = 2; i < argc-1; i+=2) {
-            if (createSentinelRedisInstance(SENTINEL_DYNAMIC_GROUP_NAME,SRI_SENTINEL,argv[i],
-                                            atoi(argv[i+1]),quorum,ri) == NULL)
+            if (createSentinelRedisInstance(SENTINEL_QUORUM_GROUP_NAME,SRI_SENTINEL,argv[i],
+                                            atoi(argv[i+1]),quorum,sentinel.group_master) == NULL)
             {
                 switch(errno) {
                 case EBUSY: return "Duplicated master name.";
@@ -1504,7 +1502,9 @@ void sentinelSendAuthIfNeeded(sentinelRedisInstance *ri, redisAsyncContext *c) {
  * one of the two links (commands and pub/sub) is missing. */
 void sentinelReconnectInstance(sentinelRedisInstance *ri) {
     if (!(ri->flags & SRI_DISCONNECTED)) return;
-
+    /* Don't try to connect to the group master */
+    if (ri == sentinel.group_master) return;
+    
     /* Commands connection. */
     if (ri->cc == NULL) {
         ri->cc = redisAsyncConnect(ri->addr->ip,ri->addr->port);
@@ -1668,6 +1668,7 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
             /* Fetch token macro
              * Looks for prefix, replaces suffix char with nul and points outptr to prefix+len(prefix)
              * Failure performs continue
+             * Note: this method uses sdsnew thus you must sdsfree It's outputs.
              */
 #define     FETCH_TOKEN(prefix, suffixchr, outptr) \
             { \
@@ -1681,6 +1682,7 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
                     ptr++; \
                     if (ptr > l+len) continue; /* Bounds check */ \
                 } else { /* Reached end of line */ } \
+                outptr = sdsnew(outptr); \
             }
 
             FETCH_TOKEN("name=", ',', name);
@@ -1689,7 +1691,13 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
 
             /* Take port from address */
             port = strchr(address, ':');
-            if (!port) continue;
+            if (!port) {
+                sdsfree(name);
+                sdsfree(address);
+                sdsfree(quorum);
+                continue;
+            }
+
             *port = '\0';
             port++;
 
@@ -1707,6 +1715,10 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
                     releaseGroupLock(name);
                 }
             }
+
+            sdsfree(name);
+            sdsfree(address);
+            sdsfree(quorum);
         }
     }
     ri->info_refresh = mstime();
@@ -1844,14 +1856,9 @@ void sentinelInfoReplyCallback(redisAsyncContext *c, void *reply, void *privdata
         sentinelRefreshInstanceInfo(ri,r->str);
     }
 
-    if ((ri->flags & SRI_SENTINEL) && ri->runid && strcmp(ri->runid, server.runid)==0) {
-        sentinelRedisInstance *internal = sentinelGetMasterByName(SENTINEL_DYNAMIC_GROUP_NAME);
-
-        if (NULL != internal) {
-            removeMatchingSentinelsFromMaster(internal,ri->addr->ip,ri->addr->port, ri->runid);
-
-            redisLog(REDIS_WARNING, "We connected to ourselves, removed!");
-        }
+    if ((ri->flags & SRI_SENTINEL) && ri->runid && strcmp(ri->runid, server.runid)==0) {        
+        removeMatchingSentinelsFromMaster(sentinel.group_master,ri->addr->ip,ri->addr->port, ri->runid);
+        redisLog(REDIS_WARNING, "We connected to ourselves, removed!");
     }
 }
 
@@ -1985,10 +1992,10 @@ void sentinelReceiveHelloMessages(redisAsyncContext *c, void *reply, void *privd
                     sentinel->flags &= ~SRI_CAN_FAILOVER;
             }
 
-            /* Emulate this hello message as if it was sent to SENTINEL_DYNAMIC_GROUP_NAME as well for sentinel discovery */
-            if (strcasecmp(ri->name, SENTINEL_DYNAMIC_GROUP_NAME) != 0)
+            /* Emulate this hello message as if it was sent to SENTINEL_QUORUM_GROUP_NAME as well for sentinel discovery */
+            if (strcasecmp(ri->name, SENTINEL_QUORUM_GROUP_NAME) != 0)
             {
-                c->data = sentinelGetMasterByName(SENTINEL_DYNAMIC_GROUP_NAME);
+                c->data = sentinelGetMasterByName(SENTINEL_QUORUM_GROUP_NAME);
                 if (c->data)
                         sentinelReceiveHelloMessages(c, reply, privdata);
                 c->data = ri;
@@ -2380,7 +2387,7 @@ void sentinelCommand(redisClient *c) {
             }
         } else if (!strcasecmp(c->argv[2]->ptr, "join")) {
             /* SENTINEL GROUP JOIN <group-name> <my-ip> <my-port> */
-            sentinelRedisInstance *ri, *sgroup = sentinelGetMasterByName(SENTINEL_DYNAMIC_GROUP_NAME);
+            sentinelRedisInstance *ri;
             char *name = NULL;
             char *ip = NULL;
             int port = 0;
@@ -2412,8 +2419,8 @@ void sentinelCommand(redisClient *c) {
                 return;
             }
 
-            int num_connected_sentinels = dictSize(sentinel.sentinels);
-            int num_needed_sentinels = sgroup->quorum;
+            int num_connected_sentinels = dictSize(sentinel.group_master->sentinels);
+            int num_needed_sentinels = sentinel.group_master->quorum;
 
             if (num_connected_sentinels > 0)
             {
@@ -2421,7 +2428,7 @@ void sentinelCommand(redisClient *c) {
                 dictIterator *di;
                 dictEntry *de;
 
-                di = dictGetIterator(sentinel.sentinels);
+                di = dictGetIterator(sentinel.group_master->sentinels);
                 while((de = dictNext(di)) != NULL) {
                     sentinelRedisInstance *instance = dictGetVal(de);
 
@@ -2864,7 +2871,7 @@ int sentinelNotifyAllSentinelsForNewGroup(sentinelGroupCreationRequest *req) {
     req->state = SENTINEL_QUORUM_STATE_UPDATING_SENTINELS;
     req->sentinels_accepted = 0;
 
-    di = dictGetIterator(sentinel.sentinels);
+    di = dictGetIterator(sentinel.group_master->sentinels);
     while((de = dictNext(di)) != NULL) {
         sentinelRedisInstance *ri = dictGetVal(de);
         int retval = 0;
@@ -2894,7 +2901,7 @@ int sentinelLockAllSentinels(sentinelGroupCreationRequest *req) {
     req->sentinels_rejected = 0;
     req->quorum_started = mstime();
 
-    di = dictGetIterator(sentinel.sentinels);
+    di = dictGetIterator(sentinel.group_master->sentinels);
     while((de = dictNext(di)) != NULL) {
         sentinelRedisInstance *ri = dictGetVal(de);
         int retval = 0;
@@ -2919,7 +2926,7 @@ void sentinelUnlockAllSentinels(sentinelGroupCreationRequest *req) {
     dictIterator *di;
     dictEntry *de;
 
-    di = dictGetIterator(sentinel.sentinels);
+    di = dictGetIterator(sentinel.group_master->sentinels);
     while((de = dictNext(di)) != NULL) {
         sentinelRedisInstance *ri = dictGetVal(de);
         int retval = 0;
