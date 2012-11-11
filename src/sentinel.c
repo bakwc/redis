@@ -206,6 +206,7 @@ typedef struct sentinelGroupCreationRequest {
     char *host; /* Master host */
     int port; /* Master port */
 
+    char *rid; /* unique request id */
     int state;
     mstime_t quorum_started; /* Time we started our quorum request */
     int quorum_needed; /* Num of sentinels needed */
@@ -218,7 +219,7 @@ typedef struct sentinelGroupCreationRequest {
  * Only when the lock is achieved we are permitted to send the group creation request.
  */
 typedef struct sentinelGroupLock {
-    int locked;
+    int locked;    
     char *owner; /* run id of the lock owner */
     char *name; /* lock name (same as group name) */
     mstime_t lock_time;
@@ -386,7 +387,7 @@ void dictInstancesValDestructor (void *privdata, void *obj) {
 
 void dictGrouplockValDestructor (void *privdata, void *obj) {
     sentinelGroupLock *lock = obj;
-    sdsfree(lock->owner);
+    sdsfree(lock->owner);    
     sdsfree(lock->name);
     zfree(lock);
 }
@@ -395,6 +396,7 @@ void dictGroupCreationRequestValDestructor (void *privdata, void *obj) {
     sentinelGroupCreationRequest *req = obj;
     sdsfree(req->name);
     sdsfree(req->host);
+    sdsfree(req->rid);
     zfree(req);
 }
 
@@ -520,6 +522,7 @@ sentinelGroupCreationRequest *createGroupCreationRequest(char *name, char *host,
     req->name = sdsnew(name);
     req->host = sdsnew(host);
     req->port = port;
+    req->rid = NULL;
 
     req->state = SENTINEL_QUORUM_STATE_NONE;
     req->quorum_started = mstime();
@@ -546,7 +549,7 @@ sentinelGroupLock *acquireGroupLock(char *name, char *owner) {
             return NULL;
         lock->lock_time = mstime();
         lock->locked = 0;
-        lock->name = NULL;
+        lock->name = NULL;        
         lock->owner = NULL;
         dictAdd(sentinel.group_locks, sdsnew(name), lock);
     }
@@ -558,9 +561,9 @@ sentinelGroupLock *acquireGroupLock(char *name, char *owner) {
 
     sdsfree(lock->name);
     sdsfree(lock->owner);
-
+    
     lock->name = sdsnew(name);
-    lock->owner = sdsnew(owner);
+    lock->owner = sdsnew(owner);    
     lock->lock_time = mstime();
     lock->locked = 1;
     return lock;
@@ -2353,17 +2356,22 @@ void sentinelCommand(redisClient *c) {
             goto numargserr;
 
         if (!strcasecmp(c->argv[2]->ptr, "lock")) {
-            /* SENTINEL GROUP LOCK (NAME) (RUNID) */
-            if (c->argc != 5)
+            /* SENTINEL GROUP LOCK (NAME) (RUNID) (REQID) */
+            if (c->argc != 6)
                 goto numargserr;
 
-            char *name = c->argv[3]->ptr;
+            char *name = c->argv[3]->ptr;            
             char *runid = c->argv[4]->ptr;
-            redisLog(REDIS_NOTICE, "Attempt to acquire group lock %s (from runid: %s)", name, runid);
+            char *reqid = c->argv[5]->ptr;            
+
+            redisLog(REDIS_NOTICE, "Attempt to acquire group lock %s (from runid: %s, reqid: %s)", name, runid, reqid);
 
             sentinelRedisInstance *ri = sentinelGetMasterByName(name);
             if (ri == NULL && acquireGroupLock(name, runid))
-                addReply(c, shared.ok);
+            {
+                addReplyMultiBulkLen(c,1);
+                addReplyBulkCString(c, reqid);                                
+            }
             else
             {
                 redisLog(REDIS_WARNING, "Acquire group lock %s from runid %s failed. ri: %p", name, runid, (void*)ri);
@@ -2375,7 +2383,7 @@ void sentinelCommand(redisClient *c) {
                 goto numargserr;
 
             char *name = c->argv[3]->ptr;
-            char *runid = c->argv[4]->ptr;
+            char *runid = c->argv[4]->ptr;            
 
             redisLog(REDIS_NOTICE, "Trying to release group lock %s (from runid: %s)", name, runid);
             sentinelGroupLock *lock = getGroupLockByName(name);
@@ -2464,15 +2472,21 @@ void sentinelCommand(redisClient *c) {
                         }
                         else
                             req = createGroupCreationRequest(name, ip, port);
-
+                        
                         if (!req) {
                             redisLog(REDIS_WARNING, "Failed to create group request");
                             addReply(c, shared.err);
                             return;
                         }
 
-                        redisLog(REDIS_NOTICE, "Initiating lock quorum for group %s requested by %s:%d",
-                                name, ip, port);
+                        char requestId[REDIS_RUN_ID_SIZE];
+                        getRandomHexChars(requestId, REDIS_RUN_ID_SIZE);
+                        requestId[REDIS_RUN_ID_SIZE] = '\0';
+                        
+                        sdsfree(req->rid);
+                        req->rid = sdsnew(requestId);
+                        redisLog(REDIS_NOTICE, "Initiating lock quorum for group %s requested by %s:%d. Request id: %s",
+                                name, ip, port, req->rid);
 
                         if (sentinelLockAllSentinels(req) == REDIS_ERR) {
                             redisLog(REDIS_WARNING, "Failed sending lock requests for group %s", name);
@@ -2779,6 +2793,11 @@ void sentinelReceiveLockRequest(redisAsyncContext *c, void *reply, void *privdat
     }
     else
     {
+        if (r->type == REDIS_REPLY_ARRAY && strcmp(r->element[0]->str, req->rid) != 0) {
+            redisLog(REDIS_WARNING, "%s:%d accepted our lock request for group %s but the reqid is wrong! (%s != %s). network lag?", ri->addr->ip, ri->addr->port, req->name, r->element[0]->str, req->rid);
+            return;
+        }
+        
         req->sentinels_accepted++;
         redisLog(REDIS_NOTICE, "%s:%d accepted our lock request for group %s", ri->addr->ip, ri->addr->port, req->name);
         if (req->sentinels_accepted == req->quorum_needed)
@@ -2911,7 +2930,7 @@ int sentinelLockAllSentinels(sentinelGroupCreationRequest *req) {
 
         retval = redisAsyncCommand(ri->cc,
                         sentinelReceiveLockRequest,
-                         req, "SENTINEL GROUP LOCK %s %s", req->name, server.runid);
+                         req, "SENTINEL GROUP LOCK %s %s %s", req->name, server.runid, req->rid);
 
         if (retval == REDIS_OK) {
             req->quorum_needed++;
