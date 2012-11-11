@@ -113,13 +113,14 @@ typedef struct sentinelAddr {
 #define SENTINEL_FAILOVER_STATE_DETECT_END 9 /* Check for failover end. */
 #define SENTINEL_FAILOVER_STATE_UPDATE_CONFIG 10 /* Monitor promoted slave. */
 
-/* Dynamic group creation quorum */
-#define SENTINEL_QUORUM_LOCK_TIMEOUT 15000 /* Timeout for achieving cluster-wide lock */
-#define SENTINEL_QUORUM_STATE_NONE 0  /* No pending lock or group creation request */
-#define SENTINEL_QUORUM_STATE_PENDING_LOCK 1 /* Lock request sent to all sentinels */
-#define SENTINEL_QUORUM_STATE_ACQUIRED_LOCK 2 /* All sentinels accepted our lock */
-#define SENTINEL_QUORUM_STATE_UPDATING_SENTINELS 3 /* Sent new group information to all sentinels */
-#define SENTINEL_QUORUM_GROUP_NAME "__sentinels__" /* Name of the sentinel's fake master name */
+/* Dynamic cluster */
+#define SENTINEL_CLUSTER_LOCK_TIMEOUT 15000 /* Timeout for achieving cluster-wide lock */
+#define SENTINEL_CLUSTER_STATE_NONE 0  /* No pending lock or group creation request */
+#define SENTINEL_CLUSTER_STATE_PENDING_LOCK 1 /* Lock request sent to all sentinels */
+#define SENTINEL_CLUSTER_STATE_ACQUIRED_LOCK 2 /* All sentinels accepted our lock */
+#define SENTINEL_CLUSTER_STATE_UPDATING_SENTINELS 3 /* Sent new group information to all sentinels */
+#define SENTINEL_CLUSTER_STATE_ROLLBACK_SENTINELS 4 /* Rolling back group creation because one sentinel failed. */
+#define SENTINEL_CLUSTER_GROUP_NAME "__sentinels__" /* Name of the sentinels fake master name */
 
 #define SENTINEL_MASTER_LINK_STATUS_UP 0
 #define SENTINEL_MASTER_LINK_STATUS_DOWN 1
@@ -231,12 +232,9 @@ struct sentinelState {
     dict *masters;      /* Dictionary of master sentinelRedisInstances.
                            Key is the instance name, value is the
                            sentinelRedisInstance structure pointer. */
-
-    sentinelRedisInstance *group_master;
-
-    dict *group_locks; /* Group lock requests for quorum (incoming) */
-    dict *group_requests; /* Pending group requests (outgoing) */
-
+    sentinelRedisInstance *cluster_master; /* Cluster master (container for cluster sentinels) */
+    dict *group_locks; /* Group lock requests for cluster (incoming) */
+    dict *group_requests; /* Pending cluster change requests (outgoing) */
     int tilt;           /* Are we in TILT mode? */
     int running_scripts;    /* Number of scripts in execution right now. */
     mstime_t tilt_start_time;   /* When TITL started. */
@@ -373,6 +371,7 @@ void sentinelDiscardReplyCallback(redisAsyncContext *c, void *reply, void *privd
 sentinelRedisInstance *createSentinelRedisInstance(char *name, int flags, char *hostname, int port, int quorum, sentinelRedisInstance *master);
 int sentinelLockAllSentinels(sentinelGroupCreationRequest *req);
 int sentinelNotifyAllSentinelsForNewGroup(sentinelGroupCreationRequest *req);
+int sentinelRollbackGroupCreation(sentinelGroupCreationRequest *req);
 void sentinelUnlockAllSentinels(sentinelGroupCreationRequest *req);
 
 /* ========================= Dictionary types =============================== */
@@ -486,18 +485,13 @@ void initSentinel(void) {
     sentinel.masters = dictCreate(&instancesDictType,NULL);
     sentinel.group_locks = dictCreate(&grouplockDictType,NULL);
     sentinel.group_requests = dictCreate(&groupCreationRequestDictType,NULL);
-
+    sentinel.cluster_master = NULL;
+    
     sentinel.tilt = 0;
     sentinel.tilt_start_time = mstime();
     sentinel.previous_time = mstime();
     sentinel.running_scripts = 0;
     sentinel.scripts_queue = listCreate();
-
-    /* Create the SENTINEL_QUORUM_GROUP_NAME master
-     * and point sentinel.sentinels to it's sentinels.
-     */
-    sentinelRedisInstance *ri = createSentinelRedisInstance(SENTINEL_QUORUM_GROUP_NAME, SRI_MASTER, SENTINEL_QUORUM_GROUP_NAME, 1, 3, NULL);
-    sentinel.group_master = ri;
 }
 
 sentinelGroupLock *getGroupLockByName(char *name) {
@@ -524,7 +518,7 @@ sentinelGroupCreationRequest *createGroupCreationRequest(char *name, char *host,
     req->port = port;
     req->rid = NULL;
 
-    req->state = SENTINEL_QUORUM_STATE_NONE;
+    req->state = SENTINEL_CLUSTER_STATE_NONE;
     req->quorum_started = mstime();
     req->quorum_needed = 0;
     req->sentinels_accepted = 0;
@@ -554,8 +548,7 @@ sentinelGroupLock *acquireGroupLock(char *name, char *owner) {
         dictAdd(sentinel.group_locks, sdsnew(name), lock);
     }
 
-    if (lock->locked) {
-        redisLog(REDIS_WARNING, "Attempt to acquire group lock %s while already locked!", name);
+    if (lock->locked) {        
         return NULL;
     }
 
@@ -581,23 +574,28 @@ void sentinelKillTimedoutGroupLocks(void) {
     while((de = dictNext(di)) != NULL) {
         sentinelGroupLock *lock = dictGetVal(de);
 
-        if (lock->locked && ((mstime() - lock->lock_time) > SENTINEL_QUORUM_LOCK_TIMEOUT))
+        if (lock->locked && ((mstime() - lock->lock_time) > SENTINEL_CLUSTER_LOCK_TIMEOUT))
         {
             sentinelGroupCreationRequest *groupRequest = getGroupCreationRequestByName(lock->name);
             redisLog(REDIS_WARNING, "Releasing timed out group lock %s\n", lock->name);
 
             if (NULL != groupRequest)
             {
-                if (strcmp(lock->owner, server.runid) == 0) // My lock timed out, unlock other sentinels.
-                    sentinelUnlockAllSentinels(groupRequest);
+                if (strcmp(lock->owner, server.runid) == 0) { 
+                    // My lock timed out, unlock other sentinels.
+                    if (groupRequest->state == SENTINEL_CLUSTER_STATE_PENDING_LOCK)
+                        sentinelUnlockAllSentinels(groupRequest);
+                    else if (groupRequest->state == SENTINEL_CLUSTER_STATE_UPDATING_SENTINELS)
+                        sentinelRollbackGroupCreation(groupRequest);
+                }
 
-                if (groupRequest->state == SENTINEL_QUORUM_STATE_PENDING_LOCK) // Only release if we are pending lock
-                {
+                if (groupRequest->state == SENTINEL_CLUSTER_STATE_PENDING_LOCK) {
+                    // Only release if we are pending lock.
                     lock->locked = 0;
-                    groupRequest->state = SENTINEL_QUORUM_STATE_NONE;
+                    groupRequest->state = SENTINEL_CLUSTER_STATE_NONE;
                 }
             }
-            else // Not my lock, just release the lock.
+            else // Not my lock, just release it.
                 lock->locked = 0;
         }
     }
@@ -618,8 +616,8 @@ sentinelAddr *createSentinelAddr(char *hostname, int port) {
         errno = EINVAL;
         return NULL;
     }
-    /* Hack for SENTINEL_QUORUM_GROUP_NAME group */
-    int isInternal = strcasecmp(hostname, SENTINEL_QUORUM_GROUP_NAME) == 0 ? 1 : 0;
+    /* Hack for SENTINEL_CLUSTER_GROUP_NAME group */
+    int isInternal = strcasecmp(hostname, SENTINEL_CLUSTER_GROUP_NAME) == 0 ? 1 : 0;
 
     if (isInternal == 0 && anetResolve(NULL,hostname,buf) == ANET_ERR) {
         errno = ENOENT;
@@ -1365,11 +1363,18 @@ char *sentinelHandleConfiguration(char **argv, int argc) {
         }
     } else if (!strcasecmp(argv[0], "cluster") && argc>=4) {
         int quorum = atoi(argv[1]);
-        sentinel.group_master->quorum = quorum;        
+
+        if (!sentinel.cluster_master) {
+            /* Create the SENTINEL_CLUSTER_GROUP_NAME master */
+            sentinelRedisInstance *ri = createSentinelRedisInstance(SENTINEL_CLUSTER_GROUP_NAME, SRI_MASTER, SENTINEL_CLUSTER_GROUP_NAME, 1, 3, NULL);
+            sentinel.cluster_master = ri;
+
+            sentinel.cluster_master->quorum = quorum;
+        }
 
         for (int i = 2; i < argc-1; i+=2) {
-            if (createSentinelRedisInstance(SENTINEL_QUORUM_GROUP_NAME,SRI_SENTINEL,argv[i],
-                                            atoi(argv[i+1]),quorum,sentinel.group_master) == NULL)
+            if (createSentinelRedisInstance(SENTINEL_CLUSTER_GROUP_NAME,SRI_SENTINEL,argv[i],
+                                            atoi(argv[i+1]),quorum,sentinel.cluster_master) == NULL)
             {
                 switch(errno) {
                 case EBUSY: return "Duplicated master name.";
@@ -1506,7 +1511,7 @@ void sentinelSendAuthIfNeeded(sentinelRedisInstance *ri, redisAsyncContext *c) {
 void sentinelReconnectInstance(sentinelRedisInstance *ri) {
     if (!(ri->flags & SRI_DISCONNECTED)) return;
     /* Don't try to connect to the group master */
-    if (ri == sentinel.group_master) return;
+    if (ri == sentinel.cluster_master) return;
     
     /* Commands connection. */
     if (ri->cc == NULL) {
@@ -1711,8 +1716,8 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
                 /* Acquire group lock to make sure we're not in the middle of a lock request */
                 if (acquireGroupLock(name, server.runid))
                 {
-                    redisLog(REDIS_NOTICE, "Discovered group %s on sentinel %s:%d (master: %s:%s)",
-                            name, ri->addr->ip, ri->addr->port, address, port);
+                    redisLog(REDIS_NOTICE, "Discovered group %s on sentinel %s (master: %s:%s)",
+                            name, ri->name, address, port);
 
                     createSentinelRedisInstance(name, SRI_MASTER, address, atoi(port), atoi(quorum), NULL);
                     releaseGroupLock(name);
@@ -1859,9 +1864,13 @@ void sentinelInfoReplyCallback(redisAsyncContext *c, void *reply, void *privdata
         sentinelRefreshInstanceInfo(ri,r->str);
     }
 
-    if ((ri->flags & SRI_SENTINEL) && ri->runid && strcmp(ri->runid, server.runid)==0) {        
-        removeMatchingSentinelsFromMaster(sentinel.group_master,ri->addr->ip,ri->addr->port, ri->runid);
-        redisLog(REDIS_WARNING, "We connected to ourselves, removed!");
+    if (sentinel.cluster_master) {
+        /* Check if we monitor ourself here.
+         * This can happen if someone specified us in our own cluster configuration */
+        if ((ri->flags & SRI_SENTINEL) && ri->runid && strcmp(ri->runid, server.runid)==0) {
+            removeMatchingSentinelsFromMaster(sentinel.cluster_master,ri->addr->ip,ri->addr->port, ri->runid);
+            redisLog(REDIS_WARNING, "I connected to myself, check the cluster configuration.");
+        }
     }
 }
 
@@ -1995,10 +2004,10 @@ void sentinelReceiveHelloMessages(redisAsyncContext *c, void *reply, void *privd
                     sentinel->flags &= ~SRI_CAN_FAILOVER;
             }
 
-            /* Emulate this hello message as if it was sent to SENTINEL_QUORUM_GROUP_NAME as well for sentinel discovery */
-            if (strcasecmp(ri->name, SENTINEL_QUORUM_GROUP_NAME) != 0)
+            /* Emulate this hello message as if it was sent to SENTINEL_CLUSTER_GROUP_NAME as well for sentinel discovery */
+            if (strcasecmp(ri->name, SENTINEL_CLUSTER_GROUP_NAME) != 0)
             {
-                c->data = sentinelGetMasterByName(SENTINEL_QUORUM_GROUP_NAME);
+                c->data = sentinelGetMasterByName(SENTINEL_CLUSTER_GROUP_NAME);
                 if (c->data)
                         sentinelReceiveHelloMessages(c, reply, privdata);
                 c->data = ri;
@@ -2351,7 +2360,7 @@ void sentinelCommand(redisClient *c) {
             addReplyBulkCString(c,addr->ip);
             addReplyBulkLongLong(c,addr->port);
         }
-    } else if (!strcasecmp(c->argv[1]->ptr, "group")) {
+    } else if (!strcasecmp(c->argv[1]->ptr, "group") && sentinel.cluster_master) {
         if (c->argc < 3)
             goto numargserr;
 
@@ -2364,7 +2373,7 @@ void sentinelCommand(redisClient *c) {
             char *runid = c->argv[4]->ptr;
             char *reqid = c->argv[5]->ptr;            
 
-            redisLog(REDIS_NOTICE, "Attempt to acquire group lock %s (from runid: %s, reqid: %s)", name, runid, reqid);
+            redisLog(REDIS_VERBOSE, "Sentinel %s requests to lock %s (reqid: %s)", runid, name, reqid);
 
             sentinelRedisInstance *ri = sentinelGetMasterByName(name);
             if (ri == NULL && acquireGroupLock(name, runid))
@@ -2374,7 +2383,7 @@ void sentinelCommand(redisClient *c) {
             }
             else
             {
-                redisLog(REDIS_WARNING, "Acquire group lock %s from runid %s failed. ri: %p", name, runid, (void*)ri);
+                redisLog(REDIS_WARNING, "Sentinel %s request to lock group %s failed. [%s]", runid, name, ri ? "exists" : "locked");
                 addReply(c, shared.err);
             }
         } else if (!strcasecmp(c->argv[2]->ptr, "unlock")) {
@@ -2385,7 +2394,7 @@ void sentinelCommand(redisClient *c) {
             char *name = c->argv[3]->ptr;
             char *runid = c->argv[4]->ptr;            
 
-            redisLog(REDIS_NOTICE, "Trying to release group lock %s (from runid: %s)", name, runid);
+            redisLog(REDIS_VERBOSE, "Sentinel %s requests to release lock %s", runid, name);
             sentinelGroupLock *lock = getGroupLockByName(name);
             if (!lock || strcmp(lock->owner, runid) != 0) {
                 addReply(c, shared.err);
@@ -2411,7 +2420,7 @@ void sentinelCommand(redisClient *c) {
 
             if (lock && lock->locked)
             {
-                redisLog(REDIS_WARNING, "%s:%d requested to join group %s but the group is locked. rejecting.",
+                redisLog(REDIS_VERBOSE, "%s:%d requested to join group %s but the group is locked. rejecting.",
                         ip, port, name);
 
                 addReplySds(c, sdsnew("-TRYAGAIN group is currently locked, try again later.\r\n"));
@@ -2419,24 +2428,23 @@ void sentinelCommand(redisClient *c) {
             }
 
             sentinelGroupCreationRequest *req = getGroupCreationRequestByName(name);
-            if (req && req->state != SENTINEL_QUORUM_STATE_NONE)
+            if (req && req->state != SENTINEL_CLUSTER_STATE_NONE)
             {
                 addReplySds(c, sdsnew("-TRYAGAIN pending quorum.\r\n"));
-                redisLog(REDIS_WARNING, "%s:%d requested to join group %s but the group creation is in progress. rejecting.",
+                redisLog(REDIS_VERBOSE, "%s:%d requested to join group %s but the group creation is in progress. rejecting.",
                         ip, port, name);
                 return;
             }
 
-            int num_connected_sentinels = dictSize(sentinel.group_master->sentinels);
-            int num_needed_sentinels = sentinel.group_master->quorum;
+            int num_connected_sentinels = dictSize(sentinel.cluster_master->sentinels);
+            int num_needed_sentinels = sentinel.cluster_master->quorum;
 
-            if (num_connected_sentinels > 0)
-            {
+            if (num_connected_sentinels > 0) {
                 /* Remove dead sentinels from this counter */
                 dictIterator *di;
                 dictEntry *de;
 
-                di = dictGetIterator(sentinel.group_master->sentinels);
+                di = dictGetIterator(sentinel.cluster_master->sentinels);
                 while((de = dictNext(di)) != NULL) {
                     sentinelRedisInstance *instance = dictGetVal(de);
 
@@ -2463,10 +2471,8 @@ void sentinelCommand(redisClient *c) {
                 } else { /* we have more sentinels we need to consult with */
                     sentinelGroupLock *lock = NULL;
 
-                    if ((lock = acquireGroupLock(name, server.runid)) != NULL)
-                    {
-                        if (req)
-                        {
+                    if ((lock = acquireGroupLock(name, server.runid)) != NULL) {
+                        if (req) {
                             sdsfree(req->host);
                             req->host = sdsnew(ip);
                         }
@@ -2485,19 +2491,19 @@ void sentinelCommand(redisClient *c) {
                         
                         sdsfree(req->rid);
                         req->rid = sdsnew(requestId);
-                        redisLog(REDIS_NOTICE, "Initiating lock quorum for group %s requested by %s:%d. Request id: %s",
-                                name, ip, port, req->rid);
+                        redisLog(REDIS_NOTICE, "Initiating cluster lock for group '%s' requested by %s:%d.",
+                                name, ip, port);
 
                         if (sentinelLockAllSentinels(req) == REDIS_ERR) {
-                            redisLog(REDIS_WARNING, "Failed sending lock requests for group %s", name);
+                            redisLog(REDIS_WARNING, "Failed sending lock requests for group '%s'", name);
                             releaseGroupLock(name);
-                            req->state = SENTINEL_QUORUM_STATE_NONE;
+                            req->state = SENTINEL_CLUSTER_STATE_NONE;
                             addReply(c, shared.err);
                         } else {
                             addReplySds(c, sdsnew("+PENDING pending quorum.\r\n"));
                         }
                     } else {
-                        redisLog(REDIS_WARNING, "Failed to acquire group lock request for %s", name);
+                        redisLog(REDIS_WARNING, "Failed to acquire lock for group '%s'", name);
                         addReply(c, shared.err);
                         return;
                     }
@@ -2528,7 +2534,7 @@ void sentinelCommand(redisClient *c) {
 
             if (c->argc != 7)
                 goto numargserr;
-
+            
             name = c->argv[3]->ptr;
             ip = c->argv[4]->ptr;
             port = atoi(c->argv[5]->ptr);
@@ -2537,14 +2543,13 @@ void sentinelCommand(redisClient *c) {
             sentinelGroupLock *lock = getGroupLockByName(name);
 
             /* Only the sentinel lock owner can also send us a group request */
-            if (lock && lock->locked && strcmp(lock->owner, runid)!=0)
-            {
+            if (lock && lock->locked && strcmp(lock->owner, runid)!=0) {
                 redisLog(REDIS_WARNING, "Got request to create group %s but group is locked by someone else.", name);
                 addReply(c, shared.err);
                 return;
             } else if (!lock || !lock->locked) {
                 /* We will not accept group creation requests without a lock first. */
-                redisLog(REDIS_WARNING, "Attempt to create group %s but we are unlocked. rejecting", name);
+                redisLog(REDIS_WARNING, "Received attempt to create group %s but we are unlocked. rejecting", name);
                 addReply(c, shared.err);
                 return;
             }
@@ -2552,7 +2557,7 @@ void sentinelCommand(redisClient *c) {
             ri = sentinelGetMasterByName(name);
 
             if (ri != NULL) {
-                redisLog(REDIS_WARNING, "Attempt to create group %s with master %s:%d but we already have that group with %s:%d", 
+                redisLog(REDIS_WARNING, "Received attempt to create group %s with master %s:%d but we already have that group with master %s:%d", 
                         name, ip, port, ri->addr->ip, ri->addr->port);
                 addReply(c, shared.err);
                 return;
@@ -2562,7 +2567,45 @@ void sentinelCommand(redisClient *c) {
                 ri = createSentinelRedisInstance(name, SRI_MASTER, ip, port, 2, NULL);
 
                 addReply(c, shared.ok);
-                redisLog(REDIS_NOTICE, "Created new group master %s with %s:%d - requested by run id %s", name, ip, port, runid);
+                redisLog(REDIS_NOTICE, "Created new group %s with master %s:%d - requested by run id %s", name, ip, port, runid);
+            }
+        } else if (!strcasecmp(c->argv[2]->ptr, "destroy")) {
+            /* SENTINEL GROUP DESTROY <group-name> <run-id> */
+            sentinelRedisInstance *ri;
+            char *name = NULL;
+            char *runid = NULL;
+
+            if (c->argc != 5)
+                goto numargserr;
+
+            name = c->argv[3]->ptr;
+            runid = c->argv[4]->ptr;
+
+            sentinelGroupLock *lock = getGroupLockByName(name);
+
+            /* Only the sentinel lock owner can also send us a group request */
+            if (lock && lock->locked && strcmp(lock->owner, runid)!=0) {
+                redisLog(REDIS_WARNING, "Got request to destroy group %s but the group is locked by someone else.", name);
+                addReply(c, shared.err);
+                return;
+            } else if (!lock || !lock->locked) {
+                /* We will not accept group creation requests without a lock first. */
+                redisLog(REDIS_WARNING, "Received attempt to destroy group %s but we are unlocked. rejecting", name);
+                addReply(c, shared.err);
+                return;
+            }
+
+            ri = sentinelGetMasterByName(name);
+
+            if (ri == NULL) {
+                redisLog(REDIS_WARNING, "Sentinel %s requested to destroy group %s but we don't have it.", 
+                        runid, name);
+                addReply(c, shared.err);
+                return;
+            } else {
+                dictDelete(sentinel.masters, ri->name);
+                addReply(c, shared.ok);
+                redisLog(REDIS_NOTICE, "Destroyed group %s - requested by run id %s", name, runid);
             }
         }
     } else if (!strcasecmp(c->argv[1]->ptr,"failover")) {
@@ -2777,8 +2820,9 @@ void sentinelReceiveLockRequest(redisAsyncContext *c, void *reply, void *privdat
     sentinelGroupCreationRequest *req = privdata;
     redisReply *r;
 
-    if (req->state != SENTINEL_QUORUM_STATE_PENDING_LOCK)
+    if (req->state != SENTINEL_CLUSTER_STATE_PENDING_LOCK)
         return;
+    
     if (!reply || !ri)
         return;
 
@@ -2786,44 +2830,73 @@ void sentinelReceiveLockRequest(redisAsyncContext *c, void *reply, void *privdat
     if (r->type == REDIS_REPLY_ERROR)
     {
         req->sentinels_rejected++;
-        redisLog(REDIS_WARNING, "%s:%d rejected our lock request for group %s", ri->addr->ip, ri->addr->port, req->name);
+        redisLog(REDIS_WARNING, "%s rejected our lock request for group '%s'", ri->name, req->name);
         sentinelUnlockAllSentinels(req);
         releaseGroupLock(req->name);
-        req->state = SENTINEL_QUORUM_STATE_NONE;
+        req->state = SENTINEL_CLUSTER_STATE_NONE;
     }
     else
     {
         if (r->type == REDIS_REPLY_ARRAY && strcmp(r->element[0]->str, req->rid) != 0) {
-            redisLog(REDIS_WARNING, "%s:%d accepted our lock request for group %s but the reqid is wrong! (%s != %s). network lag?", ri->addr->ip, ri->addr->port, req->name, r->element[0]->str, req->rid);
+            redisLog(REDIS_WARNING, "%s accepted our lock request for group '%s' but the reqid is wrong! (%s != %s). network lag?", ri->name, req->name, r->element[0]->str, req->rid);
             return;
         }
-        
+
         req->sentinels_accepted++;
-        redisLog(REDIS_NOTICE, "%s:%d accepted our lock request for group %s", ri->addr->ip, ri->addr->port, req->name);
+        redisLog(REDIS_VERBOSE, "%s accepted our lock request for group '%s'", ri->name, req->name);
         if (req->sentinels_accepted == req->quorum_needed)
         {
-            redisLog(REDIS_NOTICE, "Reached lock quorum for group %s (needed: %d) - Creating group", req->name, req->quorum_needed);
-            req->state = SENTINEL_QUORUM_STATE_ACQUIRED_LOCK;
+            redisLog(REDIS_VERBOSE, "Reached lock quorum for group '%s' (needed: %d) - Creating group", req->name, req->quorum_needed);
+            req->state = SENTINEL_CLUSTER_STATE_ACQUIRED_LOCK;
 
             if (sentinelNotifyAllSentinelsForNewGroup(req) == REDIS_ERR) {
-                redisLog(REDIS_WARNING, "Failed notifying all sentinels for group %s", req->name);
+                redisLog(REDIS_WARNING, "Failed notifying sentinels for group '%s'", req->name);
                 sentinelUnlockAllSentinels(req);
                 releaseGroupLock(req->name);
-                req->state = SENTINEL_QUORUM_STATE_NONE;
+                req->state = SENTINEL_CLUSTER_STATE_NONE;
             }
         }
     }
 }
 
+void sentinelReceiveGroupDestroyRequest(redisAsyncContext *c, void *reply, void *privdata) {
+    sentinelGroupCreationRequest *req = privdata;
+    sentinelRedisInstance *ri = c->data;
+    redisReply *r = reply;
+
+    if (req->state != SENTINEL_CLUSTER_STATE_ROLLBACK_SENTINELS)
+        return;
+    
+    if (!r || r->type == REDIS_REPLY_ERROR) {
+        redisLog(REDIS_WARNING, "Sentinel %s failed to rollback %s: %s\n", ri->name, req->name, (r ? r->str : "(NULL)"));        
+    } 
+    
+    if (++req->sentinels_accepted == req->quorum_needed) {
+        redisLog(REDIS_NOTICE, "Rollback '%s' completed.", req->name);
+        sentinelUnlockAllSentinels(req);
+        releaseGroupLock(req->name);
+        req->state = SENTINEL_CLUSTER_STATE_NONE;
+    }
+}
+
 void sentinelReceiveGroupCreateRequest(redisAsyncContext *c, void *reply, void *privdata) {
     sentinelGroupCreationRequest *req = privdata;
-
-    if (++req->sentinels_accepted == req->quorum_needed) {
-        redisLog(REDIS_NOTICE, "All sentinels were updated successfully for the new group %s (needed: %d)\n", req->name, req->quorum_needed);
+    sentinelRedisInstance *ri = c->data;
+    redisReply *r = reply;
+    
+    if (req->state != SENTINEL_CLUSTER_STATE_UPDATING_SENTINELS)
+        return;
+    
+    if (!r || r->type == REDIS_REPLY_ERROR) {
+        /* If one sentinel failed to create this group for some reason we rollback. */
+        redisLog(REDIS_WARNING, "Sentinel %s failed to create group %s: %s. *rollback*.", ri->name, req->name, (r ? r->str : "(NULL)"));
+        sentinelRollbackGroupCreation(req);
+    } else if (++req->sentinels_accepted == req->quorum_needed) {
+        redisLog(REDIS_NOTICE, "%d sentinels were updated successfully for group '%s' (needed: %d)", req->sentinels_accepted, req->name, req->quorum_needed);
         createSentinelRedisInstance(req->name, SRI_MASTER, req->host, req->port, req->quorum_needed, NULL);
         sentinelUnlockAllSentinels(req);
         releaseGroupLock(req->name);
-        req->state = SENTINEL_QUORUM_STATE_NONE;
+        req->state = SENTINEL_CLUSTER_STATE_NONE;
     }
 }
 
@@ -2832,7 +2905,7 @@ void sentinelReceiveUnlockRequest(redisAsyncContext *c, void *reply, void *privd
     redisReply *r = (redisReply*)reply;
 
     if (!r || r->type == REDIS_REPLY_ERROR) {
-        redisLog(REDIS_WARNING, "Failed unlocking sentinel %s:%d", ri->addr->ip, ri->addr->port);
+        redisLog(REDIS_WARNING, "Request to unlock sentinel %s has failed.", ri->name);
     }
 }
 
@@ -2886,11 +2959,11 @@ int sentinelNotifyAllSentinelsForNewGroup(sentinelGroupCreationRequest *req) {
     dictIterator *di;
     dictEntry *de;
 
-    redisAssert(req->state == SENTINEL_QUORUM_STATE_ACQUIRED_LOCK);
-    req->state = SENTINEL_QUORUM_STATE_UPDATING_SENTINELS;
+    redisAssert(req->state == SENTINEL_CLUSTER_STATE_ACQUIRED_LOCK);
+    req->state = SENTINEL_CLUSTER_STATE_UPDATING_SENTINELS;
     req->sentinels_accepted = 0;
 
-    di = dictGetIterator(sentinel.group_master->sentinels);
+    di = dictGetIterator(sentinel.cluster_master->sentinels);
     while((de = dictNext(di)) != NULL) {
         sentinelRedisInstance *ri = dictGetVal(de);
         int retval = 0;
@@ -2909,18 +2982,47 @@ int sentinelNotifyAllSentinelsForNewGroup(sentinelGroupCreationRequest *req) {
     dictReleaseIterator(di);
     return REDIS_OK;
 }
+
+int sentinelRollbackGroupCreation(sentinelGroupCreationRequest *req) {
+    dictIterator *di;
+    dictEntry *de;
+
+    redisAssert(req->state == SENTINEL_CLUSTER_STATE_UPDATING_SENTINELS);    
+    req->state = SENTINEL_CLUSTER_STATE_ROLLBACK_SENTINELS;
+    req->sentinels_accepted = 0;
+
+    di = dictGetIterator(sentinel.cluster_master->sentinels);
+    while((de = dictNext(di)) != NULL) {
+        sentinelRedisInstance *ri = dictGetVal(de);
+        int retval = 0;
+
+        if (ri->flags & SRI_DISCONNECTED)
+            continue;
+
+        retval = redisAsyncCommand(ri->cc,
+                        sentinelReceiveGroupDestroyRequest,
+                         req, "SENTINEL GROUP DESTROY %s %s", req->name, server.runid);
+
+        if (retval != REDIS_OK)
+            redisLog(REDIS_WARNING, "Error destroying group %s on sentinel %s\n", req->name, ri->name);
+    }
+
+    dictReleaseIterator(di);
+    return REDIS_OK;
+}
+
 /* Lock all sentinels for group creation */
 int sentinelLockAllSentinels(sentinelGroupCreationRequest *req) {
     dictIterator *di;
     dictEntry *de;
 
-    req->state = SENTINEL_QUORUM_STATE_PENDING_LOCK;
+    req->state = SENTINEL_CLUSTER_STATE_PENDING_LOCK;
     req->quorum_needed = 0;
     req->sentinels_accepted = 0;
     req->sentinels_rejected = 0;
     req->quorum_started = mstime();
 
-    di = dictGetIterator(sentinel.group_master->sentinels);
+    di = dictGetIterator(sentinel.cluster_master->sentinels);
     while((de = dictNext(di)) != NULL) {
         sentinelRedisInstance *ri = dictGetVal(de);
         int retval = 0;
@@ -2945,7 +3047,7 @@ void sentinelUnlockAllSentinels(sentinelGroupCreationRequest *req) {
     dictIterator *di;
     dictEntry *de;
 
-    di = dictGetIterator(sentinel.group_master->sentinels);
+    di = dictGetIterator(sentinel.cluster_master->sentinels);
     while((de = dictNext(di)) != NULL) {
         sentinelRedisInstance *ri = dictGetVal(de);
         int retval = 0;
@@ -3726,6 +3828,8 @@ void sentinelTimer(void) {
     sentinelRunPendingScripts();
     sentinelCollectTerminatedScripts();
     sentinelKillTimedoutScripts();
-    sentinelKillTimedoutGroupLocks();
+    
+    if (sentinel.cluster_master)
+        sentinelKillTimedoutGroupLocks();
 }
 

@@ -1206,7 +1206,7 @@ void replicationCron(void) {
     
     /* Retry join sentinel group? */    
     if (server.sentinels && (server.sentinel_conn_state == REDIS_SENTINEL_RETRY_JOIN &&
-        (time(NULL)-server.repl_sentinel_last_io >= 1)))
+        (time(NULL)-server.repl_sentinel_last_io >= (rand() % 3) + 1)))
     {
         redisLog(REDIS_WARNING, "Retrying to join sentinel group %s", server.sentinel_master_name);
         server.sentinel_conn_state = REDIS_SENTINEL_CONNECTING;
