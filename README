@@ -1,3 +1,6 @@
+This is a redi-2.6.14 branch with support of sentinel_discovery. It adds ability to detect master for redis sentinel group when redis servers and sentinels starts.
+
+-------------------------------------------
 Where to find complete Redis documentation?
 -------------------------------------------
 
