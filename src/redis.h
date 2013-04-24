@@ -629,6 +629,7 @@ struct redisServer {
     int masterport;                 /* Port of master */
     int repl_reconnect_using_sentinel; /* Reconnect to master using sentinel (if master connection failed) */
     time_t repl_sentinel_last_io;   /* Unix time of the last network activity, for timeout */
+    time_t repl_sentinel_next_update; /* Next time of polling from sentinels for slaves */
     list *sentinels;                /* List of possible sentinels we can follow */    
     listIter *sentinel_iterator;    /* Sentinels list iterator for round-robin */
     char *sentinel_master_name;     /* Name of the sentinel master we follow */

@@ -1277,3 +1277,16 @@ void replicationCron(void) {
         }
     }
 }
+
+void syncWithSentinels(void) {
+    time_t current = time(NULL);
+    if ((!server.masterhost || server.repl_sentinel_next_update < current) &&
+        server.sentinel_conn_state == REDIS_SENTINEL_NONE)
+    {
+        server.sentinel_conn_state = REDIS_SENTINEL_CONNECT;
+        /* Next sentinels polling for slave will be in (15 - 45 minutes)
+         * for slaves it's only a backup mechanism if sentinels failed to
+         * swithc slaves themself */
+        server.repl_sentinel_next_update = current + 54000 + rand() % 108000;
+    }
+}

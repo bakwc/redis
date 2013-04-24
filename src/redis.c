@@ -1037,6 +1037,10 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     /* Close clients that need to be closed asynchronous */
     freeClientsInAsyncFreeQueue();
 
+    /* Polling sentinels every 15 second - to switch role
+     * from master to slave if sentinels decide so. */
+    run_with_period(15000) syncWithSentinels();
+
     /* Replication cron function -- used to reconnect to master and
      * to detect transfer failures. */
     run_with_period(1000) replicationCron();
@@ -1243,6 +1247,7 @@ void initServerConfig() {
     server.sentinel_conn_state = REDIS_SENTINEL_NONE;
     server.repl_reconnect_using_sentinel = 0;
     server.repl_sentinel_last_io = 0;
+    server.repl_sentinel_next_update = 0;
 
     /* Client output buffer limits */
     server.client_obuf_limits[REDIS_CLIENT_LIMIT_CLASS_NORMAL].hard_limit_bytes = 0;
