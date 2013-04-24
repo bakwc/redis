@@ -499,6 +499,8 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
     if (nread <= 0) {
         redisLog(REDIS_WARNING,"I/O error trying to sync with MASTER: %s",
             (nread == -1) ? strerror(errno) : "connection lost");
+        redisLog(REDIS_WARNING, "Received: %llu bytes. Total: %llu bytes",
+                 server.repl_transfer_read, server.repl_transfer_size);
         replicationAbortSyncTransfer();
         return;
     }
