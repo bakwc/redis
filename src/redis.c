@@ -1247,7 +1247,7 @@ void initServerConfig() {
     server.sentinel_conn_state = REDIS_SENTINEL_NONE;
     server.repl_reconnect_using_sentinel = 0;
     server.repl_sentinel_last_io = 0;
-    server.repl_sentinel_next_update = 0;
+
 
     /* Client output buffer limits */
     server.client_obuf_limits[REDIS_CLIENT_LIMIT_CLASS_NORMAL].hard_limit_bytes = 0;
@@ -2259,7 +2259,7 @@ sds genRedisInfoString(char *section) {
                 }
                 if (state == NULL) continue;
                 used_mem = getClientOutputBufferMemoryUsage(slave);
-                info = sdscatprintf(info,"slave%d:%s,%d,%s,%ul\r\n",
+                info = sdscatprintf(info,"slave%d:%s,%d,%s,%lu\r\n",
                     slaveid,ip,slave->slave_listening_port,state, used_mem);
                 slaveid++;
             }
