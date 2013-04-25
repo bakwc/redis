@@ -39,6 +39,8 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <arpa/inet.h>
+#include <netdb.h>
+#include <ifaddrs.h>
 
 /* Prototyping */
 void syncWithSentinelConnected(const redisAsyncContext *c, int status);
@@ -658,18 +660,21 @@ void syncWithSentinelJoinGroupCallback(redisAsyncContext *c, void *r, void *priv
         char *type = reply->element[0]->str;
         if (strcasecmp(type, "master") == 0) {
             // Sentinel appointed me as master
+            becomeMaster();
             redisLog(REDIS_NOTICE, "I am now the master of sentinel group %s", server.sentinel_master_name);
         } else if (strcasecmp(type, "slave") == 0 && reply->elements == 3) {
             char *host = reply->element[1]->str;
             long port = atol(reply->element[2]->str);            
 
-            if (server.repl_state != REDIS_REPL_NONE && 
+            if (isSelfAddr(host, port) == 0) {
+                becomeMaster();
+                redisLog(REDIS_WARNING, "Sentinels consider me slave, but the adress of master is myself, so i'm master of group %s", server.sentinel_master_name);
+            } else if (server.repl_state != REDIS_REPL_NONE &&
                 server.masterhost != NULL && 
                 strcmp(server.masterhost, host)==0 && 
                 port==server.masterport) 
             {
                 redisLog(REDIS_NOTICE, "Our current master is in sync with sentinel %s:%d state.", sentinel->host, sentinel->port);
-
             } else {
                 redisLog(REDIS_NOTICE, "Master for sentinel group %s is %s:%d", server.sentinel_master_name, host, port);
 
@@ -1140,34 +1145,28 @@ void slaveofCommand(redisClient *c) {
     if (!strcasecmp(c->argv[1]->ptr,"no") &&
         !strcasecmp(c->argv[2]->ptr,"one")) 
     {
-        if (server.sentinel_conn_state != REDIS_SENTINEL_NONE) {
-            undoConnectWithSentinel();
-            server.sentinel_conn_state = REDIS_SENTINEL_NONE;
-        }
-
-        if (server.masterhost) {
-            sdsfree(server.masterhost);
-            server.masterhost = NULL;
-            if (server.master) freeClient(server.master);
-            cancelReplicationHandshake();
-            server.repl_state = REDIS_REPL_NONE;
-            server.repl_reconnect_using_sentinel = 0;
-            redisLog(REDIS_NOTICE,"MASTER MODE enabled (user request)");
-        }
-
+        becomeMaster();
+        redisLog(REDIS_NOTICE,"MASTER MODE enabled (user request)");
     } else {
         long port;
 
         if ((getLongFromObjectOrReply(c, c->argv[2], &port, NULL) != REDIS_OK))
             return;
 
-        /* Check if we are already attached to the specified slave */
-        if (server.masterhost && !strcasecmp(server.masterhost,c->argv[1]->ptr)
-            && server.masterport == port) {
+        if (isSlaveOf(c->argv[1]->ptr, port) == 0) {
             redisLog(REDIS_NOTICE,"SLAVE OF would result into synchronization with the master we are already connected with. No operation performed.");
             addReplySds(c,sdsnew("+OK Already connected to specified master\r\n"));
             return;
         }
+
+        if (isSelfAddr(c->argv[1]->ptr, port) == 0) {
+            becomeMaster();
+            redisLog(REDIS_WARNING, "Unable to sync with myself");
+            redisLog(REDIS_NOTICE,"MASTER MODE enabled (user request)");
+            addReplySds(c,sdsnew("+OK Can't sync with myself => i'm now master\r\n"));
+            return;
+        }
+
         /* There was no previous master or the user specified a different one,
          * we can continue. */
         sdsfree(server.masterhost);
@@ -1182,6 +1181,76 @@ void slaveofCommand(redisClient *c) {
             server.masterhost, server.masterport);
     }
     addReply(c,shared.ok);
+}
+
+int isSlaveOf(const char* host, int port) {
+    /* Check if we are already attached to the specified slave */
+    if (server.masterhost && !strcasecmp(server.masterhost, host)
+        && server.masterport == port)
+    {
+        return 0;
+    }
+    return -1;
+}
+
+void becomeMaster(void) {
+    if (server.sentinel_conn_state != REDIS_SENTINEL_NONE) {
+        undoConnectWithSentinel();
+        server.sentinel_conn_state = REDIS_SENTINEL_NONE;
+    }
+
+    if (server.masterhost) {
+        sdsfree(server.masterhost);
+        server.masterhost = NULL;
+        if (server.master) freeClient(server.master);
+        cancelReplicationHandshake();
+        server.repl_state = REDIS_REPL_NONE;
+        server.repl_reconnect_using_sentinel = 0;
+    }
+}
+
+int isLocalHost(const char* checkHost) {
+    struct ifaddrs *ifaddr, *ifa;
+    int family, s;
+    char host[NI_MAXHOST];
+
+    if (getifaddrs(&ifaddr) == -1) {
+        redisLog(REDIS_WARNING, "Failed to get local addresses");
+        return -1;
+    }
+
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL)
+            continue;
+
+        family = ifa->ifa_addr->sa_family;
+
+        if (family == AF_INET || family == AF_INET6) {
+            s = getnameinfo(ifa->ifa_addr,
+                    (family == AF_INET) ? sizeof(struct sockaddr_in) :
+                                          sizeof(struct sockaddr_in6),
+                    host, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
+            if (s != 0) {
+                continue;
+            }
+            redisLog(REDIS_WARNING, "<%s> <%s>\n", checkHost, host);
+            if (strcasecmp(checkHost, host) == 0) {
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+
+int isSelfAddr(const char* host, int port) {
+    struct hostent* hostEnt = gethostbyname(host);
+    if (isLocalHost(inet_ntoa(*(struct in_addr*)hostEnt->h_addr_list[0])) == 0 &&
+        server.port == port)
+    {
+        redisLog(REDIS_WARNING, "EQQ!");
+        return 0;
+    }
+    return -1;
 }
 
 /* --------------------------- REPLICATION CRON  ---------------------------- */

@@ -932,6 +932,10 @@ void replicationFeedMonitors(redisClient *c, list *monitors, int dictid, robj **
 void updateSlavesWaitingBgsave(int bgsaveerr);
 void replicationCron(void);
 void syncWithSentinels(void);
+int isSlaveOf(const char* host, int port);
+void becomeMaster(void);
+int isLocalHost(const char* checkHost);
+int isSelfAddr(const char* host, int port);
 
 /* Generic persistence functions */
 void startLoading(FILE *fp);
