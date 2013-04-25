@@ -698,8 +698,10 @@ void syncWithSentinelJoinGroupCallback(redisAsyncContext *c, void *r, void *priv
         }
         
         server.sentinel_conn_state = REDIS_SENTINEL_NONE;
-        redisAsyncFree(server.sentinel_conn);
-        server.sentinel_conn = NULL;
+        if (server.sentinel_conn) {
+            redisAsyncFree(server.sentinel_conn);
+            server.sentinel_conn = NULL;
+        }
         sentinel->status = REDIS_OK;
         return;
     }
@@ -1247,7 +1249,6 @@ int isSelfAddr(const char* host, int port) {
     if (isLocalHost(inet_ntoa(*(struct in_addr*)hostEnt->h_addr_list[0])) == 0 &&
         server.port == port)
     {
-        redisLog(REDIS_WARNING, "EQQ!");
         return 0;
     }
     return -1;
