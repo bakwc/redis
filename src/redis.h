@@ -1041,6 +1041,7 @@ int replicationScriptCacheExists(sds sha1);
 void replicationSetMaster(char *ip, int port);
 void replicationUnsetMaster(void);
 void replicationSendNewlineToMaster(void);
+int isLocalAddress(const char *addr);
 
 /* Generic persistence functions */
 void startLoading(FILE *fp);
