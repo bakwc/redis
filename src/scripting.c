@@ -289,7 +289,7 @@ int luaRedisGenericCommand(lua_State *lua, int raise_error) {
 
     /* Run the command */
     c->cmd = cmd;
-    call(c,REDIS_CALL_SLOWLOG | REDIS_CALL_STATS);
+    call(c,REDIS_CALL_SLOWLOG | REDIS_CALL_STATS | REDIS_CALL_PROPAGATE);
 
     /* Convert the result of the Redis command into a suitable Lua type.
      * The first thing we need is to create a single string from the client

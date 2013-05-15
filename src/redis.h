@@ -126,6 +126,7 @@
 #define REDIS_CMD_STALE 1024                /* "t" flag */
 #define REDIS_CMD_SKIP_MONITOR 2048         /* "M" flag */
 #define REDIS_CMD_ASKING 4096               /* "k" flag */
+#define REDIS_CMD_FORCE_NO_REPLICATION 8192 /* "F" flag */
 
 /* Object types */
 #define REDIS_STRING 0
