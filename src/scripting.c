@@ -336,12 +336,25 @@ int luaRedisGenericCommand(lua_State *lua, int raise_error) {
         }
     }
 
+    int propagateFlag = 0;
+
     if (cmd->flags & REDIS_CMD_RANDOM) server.lua_random_dirty = 1;
-    if (cmd->flags & REDIS_CMD_WRITE) server.lua_write_dirty = 1;
+    if (cmd->flags & REDIS_CMD_WRITE) {
+        if (!server.lua_write_dirty) {
+            server.lua_write_dirty = 1;
+
+            // propagate MULTI for AOF/replicateion
+            robj *multistring = createStringObject("MULTI",5);
+            propagate(server.multiCommand,c->db->id,&multistring,1,
+                      REDIS_PROPAGATE_AOF|REDIS_PROPAGATE_REPL);
+            decrRefCount(multistring);
+        }
+        propagateFlag = REDIS_CALL_PROPAGATE;
+    }
 
     /* Run the command */
     c->cmd = cmd;
-    call(c,REDIS_CALL_SLOWLOG | REDIS_CALL_STATS | REDIS_CALL_PROPAGATE);
+    call(c,REDIS_CALL_SLOWLOG | REDIS_CALL_STATS | propagateFlag);
 
     /* Convert the result of the Redis command into a suitable Lua type.
      * The first thing we need is to create a single string from the client
@@ -1010,6 +1023,14 @@ void evalGenericCommand(redisClient *c, int evalsha) {
             lua_gc(lua,LUA_GCSTEP,LUA_GC_CYCLE_PERIOD);
             gc_count = 0;
         }
+    }
+
+    // propagate EXEC for AOF/replicateion
+    if (server.lua_write_dirty) {
+        robj *execstring = createStringObject("EXEC",4);
+        propagate(server.multiCommand,c->db->id,&execstring,1,
+                  REDIS_PROPAGATE_AOF|REDIS_PROPAGATE_REPL);
+        decrRefCount(execstring);
     }
 
     if (err) {
