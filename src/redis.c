@@ -244,8 +244,8 @@ struct redisCommand redisCommandTable[] = {
     {"dump",dumpCommand,2,"ar",0,NULL,1,1,1,0,0},
     {"object",objectCommand,-2,"r",0,NULL,2,2,2,0,0},
     {"client",clientCommand,-2,"ar",0,NULL,0,0,0,0,0},
-    {"eval",evalCommand,-3,"s",0,zunionInterGetKeys,0,0,0,0,0},
-    {"evalsha",evalShaCommand,-3,"s",0,zunionInterGetKeys,0,0,0,0,0},
+    {"eval",evalCommand,-3,"sF",0,zunionInterGetKeys,0,0,0,0,0},
+    {"evalsha",evalShaCommand,-3,"sF",0,zunionInterGetKeys,0,0,0,0,0},
     {"slowlog",slowlogCommand,-2,"r",0,NULL,0,0,0,0,0},
     {"script",scriptCommand,-2,"ras",0,NULL,0,0,0,0,0},
     {"time",timeCommand,1,"rR",0,NULL,0,0,0,0,0},
@@ -1457,6 +1457,7 @@ void populateCommandTable(void) {
             case 'a': c->flags |= REDIS_CMD_ADMIN; break;
             case 'p': c->flags |= REDIS_CMD_PUBSUB; break;
             case 'f': c->flags |= REDIS_CMD_FORCE_REPLICATION; break;
+            case 'F': c->flags |= REDIS_CMD_FORCE_NO_REPLICATION; break;
             case 's': c->flags |= REDIS_CMD_NOSCRIPT; break;
             case 'R': c->flags |= REDIS_CMD_RANDOM; break;
             case 'S': c->flags |= REDIS_CMD_SORT_FOR_SCRIPT; break;
@@ -1614,7 +1615,7 @@ void call(redisClient *c, int flags) {
     }
 
     /* Propagate the command into the AOF and replication link */
-    if (flags & REDIS_CALL_PROPAGATE) {
+    if (flags & REDIS_CALL_PROPAGATE && !(c->cmd->flags & REDIS_CMD_FORCE_NO_REPLICATION)) {
         int flags = REDIS_PROPAGATE_NONE;
 
         if (c->cmd->flags & REDIS_CMD_FORCE_REPLICATION)
