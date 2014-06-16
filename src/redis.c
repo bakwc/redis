@@ -1748,7 +1748,6 @@ void populateCommandTable(void) {
             case 'm': c->flags |= REDIS_CMD_DENYOOM; break;
             case 'a': c->flags |= REDIS_CMD_ADMIN; break;
             case 'p': c->flags |= REDIS_CMD_PUBSUB; break;
-            case 'f': c->flags |= REDIS_CMD_FORCE_REPLICATION; break;
             case 'F': c->flags |= REDIS_CMD_FORCE_NO_REPLICATION; break;
             case 's': c->flags |= REDIS_CMD_NOSCRIPT; break;
             case 'R': c->flags |= REDIS_CMD_RANDOM; break;
