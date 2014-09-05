@@ -53,7 +53,7 @@
 #define DEFAULT_SPARSE_CONVERT 0
 #define DEFAULT_SPARSE_RATIO 2
 #define DEFAULT_SPARSE_SAFE 10
-#define DEFAULT_MAX_DEPTH 20
+#define DEFAULT_MAX_DEPTH 15
 #define DEFAULT_ENCODE_REFUSE_BADNUM 1
 #define DEFAULT_DECODE_REFUSE_BADNUM 0
 #define DEFAULT_ENCODE_KEEP_BUFFER 1
@@ -94,6 +94,11 @@ static const char *json_token_type_name[] = {
 };
 
 typedef struct {
+    strbuf_t key;
+    strbuf_t value;
+} json_pair_t;
+
+typedef struct {
     json_token_type_t ch2token[256];
     char escape2char[256];  /* Decoding */
 #if 0
@@ -112,6 +117,11 @@ typedef struct {
     int decode_refuse_badnum;
     int encode_keep_buffer;
     int encode_number_precision;
+
+    /* Keep sorting data */
+    json_pair_t **sort_stack;
+    size_t *sort_stack_lengths;
+    size_t sort_stack_size;
 } json_config_t;
 
 typedef struct {
@@ -173,6 +183,70 @@ static const char *char2escape[256] = {
 
 static int json_config_key;
 
+/* ===== MEMORY MANAGEMENT ===== */
+static void json_pairs_free(json_pair_t json_pairs[], size_t length) {
+    if (json_pairs == NULL) {
+        return;
+    }
+
+    size_t i;
+    for (i = 0; i < length; i++) {
+        strbuf_free(&json_pairs[i].key);
+        strbuf_free(&json_pairs[i].value);
+    }
+    free(json_pairs);
+}
+
+static void json_sort_stack_init(json_config_t* cfg) {
+    cfg->sort_stack = NULL;
+    cfg->sort_stack_lengths = NULL;
+    cfg->sort_stack_size = 0;
+}
+
+static void json_sort_stack_resize(json_config_t* cfg) {
+    /* Make sure there are enough slots on the stack */
+    if (cfg->sort_stack_size % 10 != 0) {
+        return;
+    }
+
+    /* Add 10 slots straightaway */
+    size_t sort_stack_size = 10 * (1 + cfg->sort_stack_size/10);
+    cfg->sort_stack = realloc(
+        cfg->sort_stack,
+        sizeof(json_pair_t*) * sort_stack_size
+    );
+    if (!cfg->sort_stack) {
+        fprintf(stderr, "Out of memory");
+        exit(-1);
+    }
+
+    /* Also keep track of length of pairs */
+    cfg->sort_stack_lengths = realloc(
+        cfg->sort_stack_lengths,
+        sizeof(size_t) * sort_stack_size
+    );
+    if (!cfg->sort_stack_lengths) {
+        fprintf(stderr, "Out of memory");
+        exit(-1);
+    }
+}
+
+static void json_sort_stack_free(json_config_t *cfg) {
+    if (cfg == NULL || cfg->sort_stack == NULL) {
+        return;
+    }
+
+    int i;
+    for (i = cfg->sort_stack_size-1; i >= 0; i--) {
+        json_pairs_free(
+            cfg->sort_stack[i],
+            cfg->sort_stack_lengths[i]
+        );
+    }
+    free(cfg->sort_stack);
+    free(cfg->sort_stack_lengths);
+}
+
 /* ===== CONFIGURATION ===== */
 
 static json_config_t *json_fetch_config(lua_State *l)
@@ -184,6 +258,7 @@ static json_config_t *json_fetch_config(lua_State *l)
     cfg = lua_touserdata(l, -1);
     if (!cfg)
         luaL_error(l, "BUG: Unable to fetch CJSON configuration");
+    json_sort_stack_init(cfg);
 
     lua_pop(l, 1);
 
@@ -346,6 +421,7 @@ static int json_destroy_config(lua_State *l)
     cfg = lua_touserdata(l, 1);
     if (cfg)
         strbuf_free(&cfg->encode_buf);
+    json_sort_stack_free(cfg);
     cfg = NULL;
 
     return 0;
@@ -357,6 +433,7 @@ static void json_create_config(lua_State *l)
     int i;
 
     cfg = lua_newuserdata(l, sizeof(*cfg));
+    json_sort_stack_init(cfg);
 
     /* Create GC method to clean up strbuf */
     lua_newtable(l);
@@ -449,11 +526,23 @@ static void json_create_config(lua_State *l)
 
 /* ===== ENCODING ===== */
 
+int jsonCompareByKey(const void *s1, const void *s2) {
+    strbuf_t a = ((json_pair_t*)s1)->key;
+    strbuf_t b = ((json_pair_t*)s2)->key;
+
+    size_t minlen = (a.length < b.length) ? a.length : b.length;
+    int cmp = memcmp(a.buf, b.buf, minlen);
+    return cmp == 0
+        ? a.length - b.length
+        : cmp;
+}
+
 static void json_encode_exception(lua_State *l, json_config_t *cfg, int lindex,
                                   const char *reason)
 {
     if (!cfg->encode_keep_buffer)
         strbuf_free(&cfg->encode_buf);
+    json_sort_stack_free(cfg);
     luaL_error(l, "Cannot serialise %s: %s",
                   lua_typename(l, lua_type(l, lindex)), reason);
 }
@@ -544,6 +633,7 @@ static void json_encode_descend(lua_State *l, json_config_t *cfg)
     if (cfg->current_depth > cfg->encode_max_depth) {
         if (!cfg->encode_keep_buffer)
             strbuf_free(&cfg->encode_buf);
+        json_sort_stack_free(cfg);
         luaL_error(l, "Cannot serialise, excessive nesting (%d)",
                    cfg->current_depth);
     }
@@ -607,24 +697,52 @@ static void json_append_object(lua_State *l, json_config_t *cfg,
     /* Object */
     strbuf_append_char(json, '{');
 
+    /* Get key length, inspired by lua_cmsgpack.c -> mp_encode_lua_table_as_map */
+    lua_pushnil(l);
+    int object_length = 0;
+    while (lua_next(l, -2) != 0) {
+        object_length++;
+        /* Keep key, pop value */
+        lua_pop(l, 1);
+    }
+
+    /* Room for keys + values */
+    json_pair_t* json_pairs = malloc(
+        sizeof(json_pair_t) * object_length
+    );
+    if (!json_pairs) {
+        fprintf(stderr, "Out of memory");
+        exit(-1);
+    }
+
+    /* Save and free later, also in case of error */
+    json_sort_stack_resize(cfg);
+    cfg->sort_stack[cfg->sort_stack_size] = json_pairs;
+    /* Update cfg->sort_stack_lengths on the go, in case of error */
+    cfg->sort_stack_lengths[cfg->sort_stack_size] = 0;
+    cfg->sort_stack_size++;
+
     lua_pushnil(l);
     /* table, startkey */
-    comma = 0;
+    int pos = -1;
     while (lua_next(l, -2) != 0) {
-        if (comma)
-            strbuf_append_char(json, ',');
-        else
-            comma = 1;
+        pos++;
+        strbuf_t *json_key = &json_pairs[pos].key;
+        strbuf_init(json_key, 0);
+        strbuf_t *json_value = &json_pairs[pos].value;
+        strbuf_init(json_value, 0);
+        /* Remember actual length of pairs on stack */
+        cfg->sort_stack_lengths[cfg->sort_stack_size-1]++;
 
         /* table, key, value */
         keytype = lua_type(l, -2);
         if (keytype == LUA_TNUMBER) {
-            strbuf_append_char(json, '"');
-            json_append_number(l, json, -2, cfg);
-            strbuf_append_mem(json, "\":", 2);
+            strbuf_append_char(json_key, '"');
+            json_append_number(l, json_key, -2, cfg);
+            strbuf_append_mem(json_key, "\":", 2);
         } else if (keytype == LUA_TSTRING) {
-            json_append_string(l, json, -2);
-            strbuf_append_char(json, ':');
+            json_append_string(l, json_key, -2);
+            strbuf_append_char(json_key, ':');
         } else {
             json_encode_exception(l, cfg, -2,
                                   "table key must be a number or string");
@@ -632,14 +750,34 @@ static void json_append_object(lua_State *l, json_config_t *cfg,
         }
 
         /* table, key, value */
-        json_append_data(l, cfg, json);
+        json_append_data(l, cfg, json_value);
+
         lua_pop(l, 1);
-        /* table, key */
+    }
+
+    qsort(json_pairs, object_length, sizeof(json_pair_t), jsonCompareByKey);
+
+    comma = 0;
+    for (pos = 0; pos < object_length; pos++) {
+        strbuf_t json_key = json_pairs[pos].key;
+        strbuf_t json_value = json_pairs[pos].value;
+        if (comma)
+            strbuf_append_char(json, ',');
+        else
+            comma = 1;
+
+        strbuf_append_mem(json, json_key.buf, json_key.length);
+        strbuf_append_mem(json, json_value.buf, json_value.length);
     }
 
     strbuf_append_char(json, '}');
 
     cfg->current_depth--;
+    cfg->sort_stack_size--;
+    json_pairs_free(
+        cfg->sort_stack[cfg->sort_stack_size],
+        cfg->sort_stack_lengths[cfg->sort_stack_size]
+    );
 }
 
 /* Serialise Lua data into JSON string. */
@@ -710,6 +848,7 @@ static int json_encode(lua_State *l)
 
     if (!cfg->encode_keep_buffer)
         strbuf_free(&cfg->encode_buf);
+    json_sort_stack_free(cfg);
 
     return 1;
 }
@@ -1080,6 +1219,7 @@ static void json_throw_parse_error(lua_State *l, json_parse_t *json,
     const char *found;
 
     strbuf_free(json->tmp);
+    json_sort_stack_free(json->cfg);
 
     if (token->type == T_ERROR)
         found = token->value.string;
